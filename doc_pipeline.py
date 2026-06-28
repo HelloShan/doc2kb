@@ -135,12 +135,39 @@ class ProgressStats:
         self.convert = {"ok": 0, "skip": 0, "garbled": 0, "empty": 0, "error": 0, "pending": 0, "total": 0}
         self.ingest = {"ok": 0, "skip": 0, "garbled": 0, "empty": 0, "error": 0, "pending": 0, "total": 0}
         self.total_chunks = 0
+        # 按错误消息分组的失败文件，用于最后汇总打印
+        self.failed_by_error: dict[str, list[tuple[str, str]]] = {}
+        # 转换前的统计（用于增量展示）
+        self.convert_new = 0
+        self.convert_changed = 0
+        self.convert_retry = 0
+        self.convert_skipped = 0
+
+    def add_convert_file_info(self, reason: str):
+        """记录文件进入转换队列的原因"""
+        if reason == "new":
+            self.convert_new += 1
+        elif reason == "changed":
+            self.convert_changed += 1
+        elif reason == "retry":
+            self.convert_retry += 1
+        elif reason == "skip":
+            self.convert_skipped += 1
 
     def convert_done(self, result: dict):
         st = result["status"]
         if st in self.convert:
             self.convert[st] += 1
         self.convert["total"] += 1
+        # 收集转换失败的按错误分类
+        if st in ("error", "garbled", "empty"):
+            error = result.get("error") or st
+            short_error = error[:120] if len(error) > 120 else error
+            if short_error not in self.failed_by_error:
+                self.failed_by_error[short_error] = []
+            self.failed_by_error[short_error].append(
+                (result["rel_path"], st)
+            )
 
     def ingest_done(self, result: dict):
         st = result["status"]
@@ -231,17 +258,28 @@ def run_build(args, log: Logger):
             state.init_file(rel, sha256, stat.st_size, mtime)
             if not convert_only and not ingest_only:
                 files_to_convert.append(fp)
+                stats.add_convert_file_info("new")
             elif convert_only:
                 files_to_convert.append(fp)
+                stats.add_convert_file_info("new")
         else:
             # 增量模式：只处理变更或失败的文件
+            entry = state.get_file_state(rel)
             if state.needs_rebuild(rel, sha256):
                 state.init_file(rel, sha256, stat.st_size, mtime)
                 if not ingest_only:
                     files_to_convert.append(fp)
+                    # 判断原因：新文件、已变更、还是上次失败
+                    if entry is None:
+                        stats.add_convert_file_info("new")
+                    elif entry.get("sha256") != sha256:
+                        stats.add_convert_file_info("changed")
+                    else:
+                        stats.add_convert_file_info("retry")
             else:
-                # 文件未变更，标记为跳过
+                # 文件未变更且转换已成功，跳过
                 state.init_file(rel, sha256, stat.st_size, mtime)
+                stats.add_convert_file_info("skip")
 
     # 入库文件列表：
     # 如果 ingest_only，从状态中找所有已完成转换但未入库的文件
@@ -266,7 +304,22 @@ def run_build(args, log: Logger):
 
     # ── Stage 1: 文档转换 ──
     if files_to_convert and not ingest_only:
-        log.info(f"\n📄 阶段 1/2: 文档转换 ({len(files_to_convert)} 个文件)...")
+        stage_label = "1/2 (仅转换)" if convert_only else "1/2"
+        log.info(f"\n📄 阶段 {stage_label}: 文档转换")
+        # 打印增量/全量明细
+        if not is_full:
+            parts = []
+            if stats.convert_new:
+                parts.append(f"新增 {stats.convert_new}")
+            if stats.convert_changed:
+                parts.append(f"变更 {stats.convert_changed}")
+            if stats.convert_retry:
+                parts.append(f"重试 {stats.convert_retry}")
+            if stats.convert_skipped:
+                parts.append(f"跳过 {stats.convert_skipped} (未变更)")
+            log.info("  " + ", ".join(parts) + f"，共 {len(files_to_convert)} 个文件")
+        else:
+            log.info(f"  全量 {len(files_to_convert)} 个文件")
         t0 = time.time()
 
         from convert import convert_batch
@@ -279,6 +332,21 @@ def run_build(args, log: Logger):
         elapsed = time.time() - t0
         log.info(f"\n转换完成: {elapsed:.1f}s")
         log.info(stats.summary())
+
+        # 打印转换失败的按错误分组汇总
+        if stats.failed_by_error:
+            total_failed = sum(len(files) for files in stats.failed_by_error.values())
+            log.warn(f"\n⚠  转换失败文件汇总（共 {total_failed} 个，按错误类型分组）：")
+            for i, (err_msg, files) in enumerate(stats.failed_by_error.items(), 1):
+                log.info(f"  [{i}] {err_msg}")
+                for rel_path, st in files[:5]:
+                    log.info(f"      [{st}] {rel_path}")
+                if len(files) > 5:
+                    log.info(f"      ... 还有 {len(files) - 5} 个同类错误文件")
+            log.info("")
+            log.info("  使用 'python doc_pipeline.py list-failed' 查看全部")
+            if convert_only:
+                log.info("  使用 'python doc_pipeline.py retry --convert-only' 重试失败文件")
 
         # 收集成功转换的 MD 文件，准备下一阶段
         if not convert_only:
@@ -377,11 +445,27 @@ def _print_final_report(state: PipelineState, stats: ProgressStats,
     log.info(f"  向量分块总数: {stats.total_chunks}")
 
     # 检查是否有失败的文件
-    failed = state.get_failed_files("all")
+    failed = state.get_failed_files("conversion")
     if failed:
-        log.warn(f"\n⚠  有 {len(failed)} 个文件存在失败状态")
-        log.info("   使用 'python doc_pipeline.py list-failed' 查看详情")
-        log.info("   使用 'python doc_pipeline.py retry' 重试")
+        # 按错误消息分组
+        by_error: dict[str, list[tuple[str, str]]] = {}
+        for rel, entry in failed:
+            conv = entry.get("conversion", {})
+            st = conv.get("status", "?") 
+            err = conv.get("error", st)
+            short_err = err[:100] if len(err) > 100 else err
+            by_error.setdefault(short_err, []).append((rel, st))
+
+        log.warn(f"\n⚠  有 {len(failed)} 个文件转换失败（按错误类型）：")
+        for i, (err_msg, files) in enumerate(by_error.items(), 1):
+            log.info(f"  [{i}] {err_msg}")
+            for rel_path, st in files[:5]:
+                log.info(f"      [{st}] {rel_path}")
+            if len(files) > 5:
+                log.info(f"      ... 还有 {len(files) - 5} 个")
+        log.info("")
+        log.info("   使用 'python doc_pipeline.py list-failed' 查看全部")
+        log.info("   使用 'python doc_pipeline.py retry --convert-only' 重试")
 
     # 知识库统计
     try:
@@ -418,8 +502,8 @@ def run_retry(args, log: Logger):
     # 构造伪 args 调用 build
     class FakeArgs:
         full = False
-        convert_only = False
-        ingest_only = False
+        convert_only = getattr(args, 'convert_only', False) or stage == "conversion"
+        ingest_only = getattr(args, 'ingest_only', False) or stage == "ingestion"
         retry = False
 
     run_build(FakeArgs(), log)
@@ -478,44 +562,57 @@ def run_status(args, log: Logger):
 # ============================================================
 
 def run_list_failed(args, log: Logger):
-    """列出失败文件"""
+    """列出失败文件（按错误类型分组）"""
     state = PipelineState(STATE_FILE)
 
     conv_failed = state.get_failed_files("conversion")
     ing_failed = state.get_failed_files("ingestion")
 
-    # 去重：先列出唯一文件
-    seen = set()
+    has_any = False
 
-    log.info("❌ 失败文件列表")
-    log.info("")
+    # ── 转换失败 ──
+    if conv_failed:
+        has_any = True
+        # 按错误消息分组
+        by_error: dict[str, list[tuple[str, str]]] = {}
+        for rel, entry in conv_failed:
+            conv = entry.get("conversion", {})
+            st = conv.get("status", "?")
+            err = conv.get("error", st)
+            short_err = err[:100] if len(err) > 100 else err
+            by_error.setdefault(short_err, []).append((rel, st))
 
-    for rel, entry in conv_failed:
-        seen.add(rel)
-        conv = entry.get("conversion", {})
-        log.err(f"  [{conv.get('status', '?')}] 转换: {rel}")
-        if conv.get("error"):
-            log.info(f"       原因: {conv['error']}")
+        log.warn(f"❌ 转换失败（共 {len(conv_failed)} 个文件）：\n")
+        for i, (err_msg, files) in enumerate(by_error.items(), 1):
+            log.info(f"  [{i}] {err_msg}")
+            for rel_path, st in sorted(files):
+                log.err(f"      [{st}] {rel_path}")
+        log.info("")
 
-    for rel, entry in ing_failed:
-        if rel in seen:
+    # ── 入库失败 ──
+    if ing_failed:
+        has_any = True
+        by_error: dict[str, list[tuple[str, str]]] = {}
+        for rel, entry in ing_failed:
             ing = entry.get("ingestion", {})
-            log.err(f"  [{ing.get('status', '?')}] 入库: {rel}")
-            if ing.get("error"):
-                log.info(f"       原因: {ing['error']}")
-        else:
-            seen.add(rel)
-            ing = entry.get("ingestion", {})
-            log.err(f"  [{ing.get('status', '?')}] 入库: {rel}")
-            if ing.get("error"):
-                log.info(f"       原因: {ing['error']}")
+            st = ing.get("status", "?")
+            err = ing.get("error", st)
+            short_err = err[:100] if len(err) > 100 else err
+            by_error.setdefault(short_err, []).append((rel, st))
 
-    if not seen:
+        log.warn(f"❌ 入库失败（共 {len(ing_failed)} 个文件）：\n")
+        for i, (err_msg, files) in enumerate(by_error.items(), 1):
+            log.info(f"  [{i}] {err_msg}")
+            for rel_path, st in sorted(files):
+                log.err(f"      [{st}] {rel_path}")
+        log.info("")
+
+    if not has_any:
         log.ok("没有失败文件")
-
-    log.info("")
-    log.info(f"共 {len(seen)} 个失败文件")
-    log.info("使用 'python doc_pipeline.py retry' 重试所有失败文件")
+    else:
+        total = len(conv_failed) + len(ing_failed)
+        log.info(f"共 {total} 个失败文件")
+        log.info("使用 'python doc_pipeline.py retry' 重试所有失败文件")
 
 
 # ============================================================
@@ -595,6 +692,10 @@ def main():
                          help="仅重试转换失败的")
     retry_p.add_argument("--ingest", action="store_true",
                          help="仅重试入库失败的")
+    retry_p.add_argument("--convert-only", action="store_true",
+                         help="仅重试转换失败的（等同于 --convert）")
+    retry_p.add_argument("--ingest-only", action="store_true",
+                         help="仅重试入库失败的（等同于 --ingest）")
 
     # status
     subparsers.add_parser("status", help="查看流水线状态汇总")
