@@ -93,8 +93,8 @@ source_docs/ (docx/pdf/md/txt/pptx/xlsx)
 
 | 格式 | 转换器 | 说明 |
 |------|--------|------|
-| `.docx` | python-docx + ZIP回退 | 损坏文件自动降级提取纯文本 |
-| `.pdf` | pypdf / Docling | 损坏PDF友好报错 |
+| `.docx` | Docling → python-docx → ZIP回退 | 三级降级，损坏文件自动提取纯文本 |
+| `.pdf` | Docling → pypdf | 高质量布局分析优先，损坏PDF友好报错 |
 | `.xlsx` | openpyxl | **自动过滤全空/全零行** |
 | `.pptx` | python-pptx | 每页幻灯片转为二级标题 |
 | `.md` | 复制+清洁 | 保留所有格式 |
@@ -144,7 +144,7 @@ PDF→MD 转换后自动检测，通过中文标点计数 + 模板匹配 + ASCII
 | `OUTPUT_MD_DIR` | `./output_md` | MD 输出目录 |
 | `DB_PATH` | `./doc2kb.lancedb` | LanceDB 路径 |
 | `LOG_FILE` | `pipeline_YYYYMMDD.log` | 日志文件（按日期） |
-| `CONVERT_WORKERS` | 2 | 并行线程数 |
+| `CONVERT_WORKERS` | 4 | 并行线程数 |
 | `CHUNK_SIZE` | 1200 | 分块字符数 |
 | `CHUNK_OVERLAP` | 300 | 块重叠字符数 |
 | `EMBEDDING_MODEL` | `bge-small-zh-v1.5` | 嵌入模型 |

@@ -128,9 +128,13 @@ def detect_broken_pdf(file_path: Path) -> tuple[bool, str]:
         old_level = logger.level
         logger.setLevel(logging.ERROR)
         try:
-            with contextlib.redirect_stderr(open(os.devnull, 'w')):
-                reader = PdfReader(str(file_path))
-                _ = len(reader.pages)
+            devnull = open(os.devnull, 'w')
+            try:
+                with contextlib.redirect_stderr(devnull):
+                    reader = PdfReader(str(file_path))
+                    _ = len(reader.pages)
+            finally:
+                devnull.close()
             return False, ''
         except pypdf_errors.PdfStreamError:
             return True, 'PDF 流意外结束（文件损坏或不完整）'
