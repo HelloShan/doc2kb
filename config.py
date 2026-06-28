@@ -39,15 +39,12 @@ LOG_FILE = os.getenv("DOC2KB_LOG_FILE", _DEFAULT_LOG)
 # 支持转换的源文件扩展名（小写）—— 仅支持以下 6 种核心格式
 SUPPORTED_EXTENSIONS = {".docx", ".md", ".pdf", ".txt", ".pptx", ".xlsx"}
 
-# PDF 转换引擎：可选 "docling"（高质量）或 "pypdf"（轻量、纯Python）
-# docling 支持复杂布局，但依赖较重；pypdf 轻量但只提取纯文本
-PDF_ENGINE = os.getenv("DOC2KB_PDF_ENGINE", "pypdf")
+# 转换引擎：Docling 为主力（支持 docx/pdf/xlsx/pptx），原生解析为降级
+# Docling 提供表格还原、多栏识别、页眉页脚剥离等高级能力
+CONVERT_ENGINE = os.getenv("DOC2KB_CONVERT_ENGINE", "docling")
 
-# 当 PDF 用 pypdf 提取的文字少于此阈值字符数时，尝试 OCR 回退
-PDF_MIN_TEXT_CHARS = 50
-
-# DOCX 转换时是否保留图片（仅存占位符引用）
-DOCX_KEEP_IMAGES = True
+# 生成 MD 文件超过此大小（MB）时打印警告
+MAX_MD_FILE_SIZE_MB = 20
 
 # ============================================================
 # 3. RAG / 分块配置
@@ -70,11 +67,11 @@ TOP_K = 5
 SIMILARITY_THRESHOLD = 0.5
 
 # ============================================================
-# 4. 并发与内存控制（最低 2 线程 / 2GB 内存可用）
+# 4. 并发与内存控制
 # ============================================================
 
 # 转换阶段的并行线程数
-CONVERT_WORKERS = 2
+CONVERT_WORKERS = 8
 
 # 入库阶段的 batch 大小（每批处理的文本数）
 EMBED_BATCH_SIZE = 32
@@ -105,8 +102,8 @@ COLOR_OUTPUT = True
 
 def validate_config():
     """检查配置合理性，打印警告"""
-    if CONVERT_WORKERS < 1 or CONVERT_WORKERS > 4:
-        print(f"[WARN] CONVERT_WORKERS={CONVERT_WORKERS}，推荐 1-4（当前限制 2 线程/2GB 内存）")
+    if CONVERT_WORKERS < 1 or CONVERT_WORKERS > 16:
+        print(f"[WARN] CONVERT_WORKERS={CONVERT_WORKERS}，推荐 1-16")
     if DB_FLUSH_INTERVAL < 5:
         print(f"[WARN] DB_FLUSH_INTERVAL={DB_FLUSH_INTERVAL} 过小，可能影响性能")
     if CHUNK_SIZE < CHUNK_OVERLAP * 2:

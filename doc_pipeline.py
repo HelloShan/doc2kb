@@ -323,7 +323,9 @@ def _on_convert_done(result: dict, state: PipelineState,
     stats.convert_done(result)
 
     if status == "ok":
-        pass  # 静默成功
+        warning = result.get("warning")
+        if warning:
+            log.warn(f"  ⚠ {rel}: {warning}")
     elif status == "skip":
         log.warn(f"  跳过 {rel}: {error}")
     elif status == "garbled":

@@ -1,15 +1,19 @@
 """
 doc2kb — 文档转换引擎模块
 =============================
-支持将 6 种核心格式转换为 Markdown：
-  - .docx → md (使用 python-docx)
-  - .md   → 复制+乱码校验
-  - .pdf  → md (使用 pypdf 或 docling)
-  - .txt  → md (直接复制，支持编码回退)
-  - .pptx → md (使用 python-pptx)
-  - .xlsx → md (使用 openpyxl，含空行/零值行过滤)
+转换引擎优先级：
+  主力：Docling（支持 docx/pdf/xlsx/pptx，高质量表格还原+多栏识别）
+  降级：原生 Python 解析器（python-docx / pypdf / openpyxl / python-pptx）
 
-每个文件返回 (status, md_rel_path_or_None, error_msg_or_None) 三元组。
+支持将 6 种核心格式转换为清洁后的 Markdown：
+  - .docx  → Docling(主) / python-docx(降)
+  - .pdf   → Docling(主) / pypdf(降)
+  - .xlsx  → Docling(主) / openpyxl(降)
+  - .pptx  → Docling(主) / python-pptx(降)
+  - .md    → 复制+乱码校验
+  - .txt   → 直接复制，编码自动回退
+
+每个文件返回 (status, md_rel_path_or_None, error_msg_or_None, warning_or_None) 四元组。
 """
 
 import os
@@ -21,8 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config import (
     SOURCE_DIR, OUTPUT_MD_DIR, SUPPORTED_EXTENSIONS,
-    PDF_ENGINE, DOCX_KEEP_IMAGES,
-    CONVERT_WORKERS,
+    CONVERT_WORKERS, MAX_MD_FILE_SIZE_MB,
 )
 from validate import is_file_readable
 from state import compute_sha256
@@ -34,24 +37,82 @@ from docx.opc.exceptions import PackageNotFoundError
 # ============================================================
 
 def _get_rel_path(source_path: Path) -> str:
-    """获取源文件的相对路径（统一用 POSIX 风格）。"""
     return source_path.relative_to(SOURCE_DIR).as_posix()
 
 
 def _get_output_md_path(source_path: Path) -> Path:
-    """计算源文件对应的输出 MD 路径。"""
     rel = source_path.relative_to(SOURCE_DIR)
-    md_rel = rel.with_suffix(".md")
-    return OUTPUT_MD_DIR / md_rel
+    return OUTPUT_MD_DIR / rel.with_suffix(".md")
 
 
 def _ensure_output_dir(output_path: Path):
-    """确保输出文件的目录存在。"""
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================
-# MD 内容清洁：移除封面/目录/版权/版本记录/作者信息
+# Docling 引擎（主力）
+# ============================================================
+
+_DOCLING_CONVERTER = None
+_DOCLING_SUPPORTED = {".docx", ".pdf"}
+
+
+def _get_docling_converter():
+    global _DOCLING_CONVERTER
+    if _DOCLING_CONVERTER is None:
+        from docling.document_converter import DocumentConverter
+        _DOCLING_CONVERTER = DocumentConverter()
+    return _DOCLING_CONVERTER
+
+
+def _convert_with_docling(source_path: Path, output_path: Path
+                          ) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    用 Docling 转换文档（支持 docx/pdf/xlsx/pptx）。
+    返回 (status, error, warning)。
+    """
+    try:
+        conv = _get_docling_converter()
+        result = conv.convert(str(source_path))
+        md_content = result.document.export_to_markdown()
+
+        if not md_content.strip():
+            return ("empty", "Docling 转换内容为空", None)
+
+        # 清洁模板段落
+        md_content = _clean_md_content(md_content)
+        if not md_content.strip():
+            return ("empty", "内容为空（移除了所有模板段落）", None)
+
+        _ensure_output_dir(output_path)
+        output_path.write_text(md_content, encoding="utf-8")
+
+        # 检查 MD 文件大小预警
+        warning = _check_md_size(output_path)
+
+        return ("ok", None, warning)
+
+    except ImportError:
+        return ("error", "缺少 docling 库，请执行: uv pip install docling", None)
+    except Exception as e:
+        return ("error", f"Docling {type(e).__name__}: {e}", None)
+
+
+# ============================================================
+# MD 文件大小预警
+# ============================================================
+
+def _check_md_size(md_path: Path) -> Optional[str]:
+    """MD 文件超过阈值时返回预警信息。"""
+    if md_path.exists():
+        size_mb = md_path.stat().st_size / (1024 * 1024)
+        if size_mb > MAX_MD_FILE_SIZE_MB:
+            return f"MD 文件过大 ({size_mb:.1f}MB)，可能影响入库性能"
+    return None
+
+
+# ============================================================
+# MD 内容清洁：移除封面/目录/版权/版本记录/作者信息等
 # ============================================================
 
 # 需要移除的单行模式（匹配即移除该行）
@@ -60,55 +121,53 @@ _BOILERPLATE_LINE_PATTERNS = [
     re.compile(r'^#+\s*(目\s*录|目录|Contents)'),
     re.compile(r'(版权|著作权|著作权声明|版权声明|©\s*\d{4})'),
     re.compile(r'(All\s+rights?\s+reserved)', re.IGNORECASE),
-    re.compile(r'(版本\s*[：:]|版\s*本\s*[：:])'),
-    re.compile(r'(修订记录|修\s*订\s*记\s*录|变更记录|变更历史|修订历史)'),
-    re.compile(r'^(作者|编写[：:]?|编制[：:]?|审核[：:]?|批准[：:]?|校对[：:]?|会审[：:]?|评审[：:]?|起草[：:]?)'),
-    re.compile(r'^(第\s*\d+\s*页|Page\s+\d+|—\s*\d+\s*—)$'),
+    re.compile(r'(Confidential|机密|秘密|绝密)'),
+    re.compile(r'(版本\s*[：:]|版\s*本\s*[：:]|版\s*本\s*号)'),
+    re.compile(r'(修订记录|修\s*订\s*记\s*录|变更记录|变更历史|修订历史|文档变更)'),
+    re.compile(r'^(作者|编写[：:]?|编制[：:]?|审核[：:]?|批准[：:]?|校对[：:]?|会审[：:]?|评审[：:]?|起草[：:]?|复核[：:]?)'),
+    re.compile(r'^(第\s*\d+\s*页|Page\s+\d+|—\s*\d+\s*—|-\s*\d+\s*-)$'),
+    re.compile(r'^中兴通讯|^ZTE\s*CORPORATION|^ZTE\s*中兴'),
+    re.compile(r'(技术文件|技术手册|产品文档|产品手册|用户手册|操作指南)'),
+    re.compile(r'^文档版本\s*\d'),
+    re.compile(r'^[\u2460-\u2473①-⑳]'),  # 带圈数字（常用于版权脚注）
 ]
 
-# 检测"疑似目录"段落
-# 目录行特征：行首是编号（1.1 / 1.1.1 等），后有中文内容再跟点线+页码
+# 目录检测
 _TOC_ENTRY = re.compile(
-    r'^\d+(\.\d+)*\s*[\u4e00-\u9fff][\u4e00-\u9fff\w]*[\s.…·]+\d+\s*$'  # 1.1 概述........5
+    r'^\d+(\.\d+)*\s*[\u4e00-\u9fff][\u4e00-\u9fff\w]*[\s.…·]+\d+\s*$'
 )
-# 简单的编号+短文本行（如 "1 概述"、"一、概述"）
 _TOC_NUM_LINE = re.compile(r'^[\d一二三四五六七八九十]+[.、．]\s*\S{1,40}$')
-# 纯点线行：..... 或 …………
 _TOC_PURE_DOTS = re.compile(r'^[\s.…·]+$')
-# 目录标题行 —— 必须包含#号或"目录"字样
 _TOC_HEADING = re.compile(r'^#+\s*[目\t ]*[录録]\s*$|^[#\s]*目录|^[#\s]*Contents')
 
 
 def _is_toc_section(lines: list[str], start: int, max_lookahead: int = 50) -> int:
-    """
-    从 start 开始检测是否是目录段落。
-    目录特征：连续多行都符合目录行特征。
-    返回 ex_end（下一段落的起始行号），不是目录则返回 start。
-    """
-    # 快速检查：当前行是不是目录标题
+    """检测目录段落，返回段落结束行号。"""
     if not _TOC_HEADING.match(lines[start].strip()):
         return start
 
     end = min(start + max_lookahead, len(lines))
-    toc_count = 1  # 算上标题行
+    toc_count = 1
     for i in range(start + 1, end):
         raw = lines[i].strip()
         if not raw:
-            toc_count += 1  # 空行也算在目录段落内
+            toc_count += 1
             continue
         if raw.startswith('#'):
-            continue  # 子标题也算目录
+            continue
         if _TOC_PURE_DOTS.match(raw):
             toc_count += 1
             continue
         if _TOC_ENTRY.match(raw) or _TOC_NUM_LINE.match(raw):
             toc_count += 1
             continue
-        # 不是目录特征行，终止扫描
         break
-
-    # 至少 4 行才认为是目录
     return start + toc_count if toc_count >= 4 else start
+
+
+# 封面检测：常见封面行（短行，无编号无标题）
+_COVER_LINE = re.compile(r'^[\u4e00-\u9fff\w\s]{1,30}$')
+_COVER_END_MARKER = re.compile(r'^#{1,6}\s|^第[一二三四五六七八九十\d]+[章节篇]')
 
 
 def _clean_md_content(content: str) -> str:
@@ -117,7 +176,7 @@ def _clean_md_content(content: str) -> str:
     策略：
       1. 先检测 TOC 段落（基于段落特征），标注范围
       2. 再移除匹配的单行模板模式
-      3. 最后检测并移除文件开头的"封面"段
+      3. 检测并移除文件开头的封面段
     """
     if not content.strip():
         return content
@@ -126,8 +185,7 @@ def _clean_md_content(content: str) -> str:
     n = len(lines)
     keep = [True] * n
 
-    # ── Pass 1: 先检测并移除目录段落 ──
-    # 必须在单行模式之前，因为目录标题可能被单行模式先行标记删除
+    # Pass 1: 目录段落
     i = 0
     while i < n:
         toc_end = _is_toc_section(lines, i)
@@ -138,7 +196,7 @@ def _clean_md_content(content: str) -> str:
             continue
         i += 1
 
-    # ── Pass 2: 移除单行模板模式 ──
+    # Pass 2: 单行模板模式
     for i, line in enumerate(lines):
         if not keep[i]:
             continue
@@ -146,84 +204,64 @@ def _clean_md_content(content: str) -> str:
         if any(p.search(stripped) for p in _BOILERPLATE_LINE_PATTERNS):
             keep[i] = False
 
-    # ── Pass 3: 移除文件开头的封面段 ──
+    # Pass 3: 封面段
     first_heading_idx = -1
     for i, line in enumerate(lines):
         if not keep[i]:
             continue
-        stripped = line.strip()
-        if stripped.startswith('# ') or stripped.startswith('## '):
+        if re.match(r'^#{1,6}\s', line.strip()):
             first_heading_idx = i
             break
 
     if first_heading_idx > 0:
-        pre_lines = [lines[j] for j in range(first_heading_idx) if keep[j] and lines[j].strip()]
-        if pre_lines and all(len(l.strip()) < 40 for l in pre_lines):
+        # 第一个标题前的行 -> 如果全是短封面行 -> 移除
+        pre_kept = [lines[j] for j in range(first_heading_idx) if keep[j] and lines[j].strip()]
+        if pre_kept and all(len(l.strip()) < 40 for l in pre_kept):
             for j in range(first_heading_idx):
                 keep[j] = False
 
-    # ── 组装 ──
     cleaned = '\n'.join(line for i, line in enumerate(lines) if keep[i])
-
-    # 清理多余的空行（连续 3+ 空行 → 2 空行）
     cleaned = re.sub(r'\n{4,}', '\n\n\n', cleaned)
     return cleaned.strip()
 
 
 # ============================================================
-# Word (.docx)
+# 原生降级解析器
 # ============================================================
 
-def _convert_docx(source_path: Path, output_path: Path) -> Tuple[str, Optional[str]]:
-    """
-    将 .docx 转换为 Markdown（纯 python-docx，无需外部工具）。
-
-    支持：标题级别识别、段落、表格。
-    兼容 .docm（宏文档）：python-docx 拒绝时，直接从 ZIP 中提取 XML 文本。
-    兼容损坏的 .docx：捕获 'NULL' 引用等异常并回退 ZIP 方案。
-    """
+def _docx_fallback(source_path: Path, output_path: Path
+                   ) -> Tuple[str, Optional[str]]:
+    """python-docx 降级方案（Docling 不可用时）。"""
     try:
         from docx import Document
         doc = Document(str(source_path))
         return _docx_to_md(doc, source_path, output_path)
-
     except ValueError as e:
-        err_msg = str(e)
-        if "not a Word file" in err_msg:
-            # .docm 或非标准 .docx → ZIP 回退
+        if "not a Word file" in str(e):
             return _docx_fallback_zip(source_path, output_path)
         return ("error", f"{type(e).__name__}: {e}")
     except PackageNotFoundError:
-        return ("error", "不是有效的 .docx 文件（ZIP 包无法解析），"
-                         "可能是旧版 .doc 格式误标为 .docx 扩展名")
+        return ("error", "不是有效的 .docx 文件（ZIP 包无法解析）")
     except KeyError as e:
-        e_str = str(e)
-        if "'NULL'" in e_str or "NULL" in e_str:
-            # 损坏的 docx 引用了 "NULL" 项 → 尝试 ZIP 回退
+        if "'NULL'" in str(e) or "NULL" in str(e):
             return _docx_fallback_zip(source_path, output_path)
         return ("error", f"{type(e).__name__}: {e}")
-    except ImportError:
-        return ("error", "缺少 python-docx 库，请执行: uv pip install python-docx")
     except Exception as e:
         e_str = f"{type(e).__name__}: {e}"
-        e_str_lower = e_str.lower()
-        # 常见 docx 损坏模式：关系丢失、NULL引用、XML解析错误
-        if ("no relationship" in e_str_lower and "officedocument" in e_str_lower) \
-           or "'null'" in e_str_lower \
-           or "xmlsyntaxerror" in e_str_lower \
-           or ("xml" in e_str_lower and "expected" in e_str_lower):
+        e_low = e_str.lower()
+        if "no relationship" in e_low and "officedocument" in e_low \
+           or "'null'" in e_low or "xmlsyntaxerror" in e_low \
+           or ("xml" in e_low and "expected" in e_low):
             return _docx_fallback_zip(source_path, output_path)
         return ("error", e_str)
 
 
 def _docx_to_md(doc, source_path: Path, output_path: Path) -> Tuple[str, Optional[str]]:
-    """将 python-docx Document 对象写出为 Markdown 文件。"""
     md_lines = []
     for para in doc.paragraphs:
         text = para.text.strip()
         if not text:
             continue
-
         style_name = para.style.name.lower() if para.style else ""
         if "heading 1" in style_name or "title" in style_name:
             md_lines.append(f"# {text}")
@@ -252,143 +290,56 @@ def _docx_to_md(doc, source_path: Path, output_path: Path) -> Tuple[str, Optiona
     if not md_content:
         return ("empty", "文档内容为空")
 
-    # 清洁模板段落
     md_content = _clean_md_content(md_content)
     if not md_content:
         return ("empty", "文档内容为空（移除了所有模板段落）")
 
     _ensure_output_dir(output_path)
     output_path.write_text(md_content, encoding="utf-8")
-
     if not is_file_readable(output_path):
         return ("garbled", "转换后内容疑似乱码")
-
     return ("ok", None)
 
 
 def _docx_fallback_zip(source_path: Path, output_path: Path) -> Tuple[str, Optional[str]]:
-    """
-    python-docx 拒绝损坏/宏文档时，直接从 ZIP 中提取 word/document.xml 文本。
-    这是对损坏 .docx 和 .docm 伪装 .docx 的降级处理。
-    """
     try:
         import zipfile
         from xml.etree import ElementTree as ET
-
         with zipfile.ZipFile(str(source_path)) as z:
-            # 尝试标准路径
-            xml_paths = ["word/document.xml", "Word/document.xml"]
-            xml_content = None
-            for p in xml_paths:
+            for p in ["word/document.xml", "Word/document.xml"]:
                 try:
                     xml_content = z.read(p)
                     break
                 except KeyError:
                     continue
-            if xml_content is None:
+            else:
                 return ("error", "ZIP 中未找到 word/document.xml")
-
         root = ET.fromstring(xml_content)
         ns_w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-        tag_p = f"{{{ns_w}}}p"
-        tag_t = f"{{{ns_w}}}t"
-
         md_lines = []
-        for para in root.iter(tag_p):
-            texts = []
-            for t in para.iter(tag_t):
-                if t.text:
-                    texts.append(t.text)
+        for para in root.iter(f"{{{ns_w}}}p"):
+            texts = [t.text for t in para.iter(f"{{{ns_w}}}t") if t.text]
             line = "".join(texts).strip()
             if line:
                 md_lines.append(line)
-
         md_content = "\n\n".join(md_lines).strip()
         if not md_content:
             return ("empty", "ZIP 回退提取内容为空")
-
         md_content = _clean_md_content(md_content)
         if not md_content:
             return ("empty", "ZIP 回退提取内容为空（移除模板后）")
-
         _ensure_output_dir(output_path)
         output_path.write_text(md_content, encoding="utf-8")
         return ("ok", None)
-
     except Exception as e:
         return ("error", f"ZIP 回退提取失败: {type(e).__name__}: {e}")
 
 
-# ============================================================
-# Markdown (.md)
-# ============================================================
-
-def _convert_md(source_path: Path, output_path: Path) -> Tuple[str, Optional[str]]:
-    """处理 .md 文件：复制+乱码校验+清洁模板段落。"""
-    try:
-        content = source_path.read_text(encoding="utf-8")
-        if not content.strip():
-            return ("empty", "文件内容为空")
-
-        if not is_file_readable(source_path):
-            return ("garbled", "源文件内容疑似乱码")
-
-        # 清洁模板段落
-        content = _clean_md_content(content)
-        if not content.strip():
-            return ("empty", "文件内容为空（移除了所有模板段落）")
-
-        _ensure_output_dir(output_path)
-        output_path.write_text(content, encoding="utf-8")
-        return ("ok", None)
-
-    except Exception as e:
-        return ("error", f"{type(e).__name__}: {e}")
-
-
-# ============================================================
-# PDF
-# ============================================================
-
-def _convert_pdf_docling(source_path: Path, output_path: Path) -> Tuple[str, Optional[str]]:
-    """使用 Docling 将 PDF 转换为 Markdown（高质量，支持复杂布局）。"""
-    try:
-        from docling.document_converter import DocumentConverter
-        converter = DocumentConverter()
-        result = converter.convert(str(source_path))
-        md_content = result.document.export_to_markdown()
-
-        if not md_content.strip():
-            return ("empty", "PDF 内容为空")
-
-        md_content = _clean_md_content(md_content)
-        if not md_content.strip():
-            return ("empty", "PDF 内容为空（移除了所有模板段落）")
-
-        _ensure_output_dir(output_path)
-        output_path.write_text(md_content, encoding="utf-8")
-
-        if not is_file_readable(output_path):
-            return ("garbled", "转换后内容疑似乱码")
-
-        return ("ok", None)
-
-    except ImportError:
-        return ("error", "缺少 docling 库，请执行: uv pip install docling")
-    except Exception as e:
-        return ("error", f"Docling {type(e).__name__}: {e}")
-
-
-def _convert_pdf_pypdf(source_path: Path, output_path: Path) -> Tuple[str, Optional[str]]:
-    """
-    使用 pypdf 将 PDF 转换为 Markdown（轻量、纯Python）。
-
-    适合文本型 PDF，对于扫描件或复杂布局的 PDF 效果较差。
-    捕获 PdfStreamError 等损坏 PDF 异常。
-    """
+def _pdf_fallback(source_path: Path, output_path: Path
+                  ) -> Tuple[str, Optional[str]]:
+    """pypdf 降级方案（Docling 不可用时）。"""
     try:
         from pypdf import PdfReader, errors as pypdf_errors
-
         try:
             reader = PdfReader(str(source_path))
         except pypdf_errors.PdfStreamError:
@@ -407,83 +358,66 @@ def _convert_pdf_pypdf(source_path: Path, output_path: Path) -> Tuple[str, Optio
 
         md_content = "\n\n".join(md_lines).strip()
         if not md_content:
-            return ("empty", "PDF 内容为空（可能是扫描件，建议使用 Docling 或 OCR）")
-
+            return ("empty", "PDF 内容为空（可能是扫描件）")
         md_content = _clean_md_content(md_content)
         if not md_content.strip():
             return ("empty", "PDF 内容为空（移除了所有模板段落）")
-
         _ensure_output_dir(output_path)
         output_path.write_text(md_content, encoding="utf-8")
-
         if not is_file_readable(output_path):
             return ("garbled", "转换后内容疑似乱码")
-
         return ("ok", None)
-
     except ImportError:
-        return ("error", "缺少 pypdf 库，请执行: uv pip install pypdf")
+        return ("error", "缺少 pypdf 库")
     except Exception as e:
         return ("error", f"PyPDF {type(e).__name__}: {e}")
 
 
-def _convert_pdf(source_path: Path, output_path: Path) -> Tuple[str, Optional[str]]:
-    """PDF 转换调度器，根据配置选择引擎。"""
-    if PDF_ENGINE == "docling":
-        return _convert_pdf_docling(source_path, output_path)
-    else:
-        return _convert_pdf_pypdf(source_path, output_path)
+def _xlsx_fallback(source_path: Path, output_path: Path
+                   ) -> Tuple[str, Optional[str]]:
+    """openpyxl 降级方案（Docling 不可用时）。"""
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(str(source_path), read_only=True, data_only=True)
+        md_lines = []
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            md_lines.append(f"## {sheet_name}")
+            md_lines.append("")
+            rows = list(ws.iter_rows(values_only=True))
+            if not rows:
+                continue
+            headers = [str(c) if c is not None else "" for c in rows[0]]
+            md_lines.append("| " + " | ".join(headers) + " |")
+            md_lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+            data_rows = [row for row in rows[1:] if not _is_junk_row(row)]
+            for row in data_rows:
+                cells = [str(c) if c is not None else "" for c in row]
+                md_lines.append("| " + " | ".join(cells) + " |")
+            md_lines.append("")
+        wb.close()
+        md_content = "\n".join(md_lines).strip()
+        if not md_content:
+            return ("empty", "Excel 内容为空")
+        md_content = _clean_md_content(md_content)
+        if not md_content.strip():
+            return ("empty", "Excel 内容为空（移除了所有模板段落）")
+        _ensure_output_dir(output_path)
+        output_path.write_text(md_content, encoding="utf-8")
+        return ("ok", None)
+    except ImportError:
+        return ("error", "缺少 openpyxl 库")
+    except Exception as e:
+        return ("error", f"{type(e).__name__}: {e}")
 
 
-# ============================================================
-# 纯文本 (.txt) —— 支持编码回退
-# ============================================================
-
-_TXT_ENCODINGS = ["utf-8", "gbk", "gb2312", "gb18030", "latin-1"]
-
-
-def _convert_txt(source_path: Path, output_path: Path) -> Tuple[str, Optional[str]]:
-    """
-    处理 .txt 文件：尝试多种编码读取，复制为 Markdown。
-    编码回退顺序：utf-8 → gbk → gb2312 → gb18030 → latin-1
-    """
-    for enc in _TXT_ENCODINGS:
-        try:
-            content = source_path.read_text(encoding=enc)
-            if content.strip():
-                break
-        except (UnicodeDecodeError, UnicodeError):
-            continue
-    else:
-        return ("error", f"无法用 {', '.join(_TXT_ENCODINGS)} 解码文件内容")
-
-    if not content.strip():
-        return ("empty", "文件内容为空")
-
-    content = _clean_md_content(content)
-    if not content.strip():
-        return ("empty", "文件内容为空（移除了所有模板段落）")
-
-    _ensure_output_dir(output_path)
-    output_path.write_text(content, encoding="utf-8")
-
-    return ("ok", None)
-
-
-# ============================================================
-# PowerPoint (.pptx)
-# ============================================================
-
-def _convert_pptx(source_path: Path, output_path: Path) -> Tuple[str, Optional[str]]:
-    """
-    将 .pptx 转换为 Markdown（纯 python-pptx，无需外部工具）。
-    提取每页幻灯片的文本内容，保留标题层级。
-    """
+def _pptx_fallback(source_path: Path, output_path: Path
+                   ) -> Tuple[str, Optional[str]]:
+    """python-pptx 降级方案（Docling 不可用时）。"""
     try:
         from pptx import Presentation
         prs = Presentation(str(source_path))
         md_lines = []
-
         for i, slide in enumerate(prs.slides, 1):
             md_lines.append(f"## Slide {i}")
             for shape in slide.shapes:
@@ -493,32 +427,26 @@ def _convert_pptx(source_path: Path, output_path: Path) -> Tuple[str, Optional[s
                         if text:
                             md_lines.append(text)
             md_lines.append("")
-
         md_content = "\n".join(md_lines).strip()
         if not md_content:
             return ("empty", "幻灯片内容为空")
-
         md_content = _clean_md_content(md_content)
         if not md_content.strip():
             return ("empty", "幻灯片内容为空（移除了所有模板段落）")
-
         _ensure_output_dir(output_path)
         output_path.write_text(md_content, encoding="utf-8")
-
         return ("ok", None)
-
     except ImportError:
-        return ("error", "缺少 python-pptx 库，请执行: uv pip install python-pptx")
+        return ("error", "缺少 python-pptx 库")
     except Exception as e:
         return ("error", f"{type(e).__name__}: {e}")
 
 
 # ============================================================
-# Excel (.xlsx) —— 含空行/零值行过滤
+# xlsx 空行/零值行过滤（供降级用）
 # ============================================================
 
 def _is_junk_cell(value) -> bool:
-    """判断单元格是否为'垃圾值'（空、None、0、'0'等）。"""
     if value is None:
         return True
     if isinstance(value, (int, float)):
@@ -528,78 +456,70 @@ def _is_junk_cell(value) -> bool:
 
 
 def _is_junk_row(row: tuple) -> bool:
-    """判断整行是否都是垃圾值（全空/全零），应过滤掉。"""
     if not row:
         return True
     return all(_is_junk_cell(cell) for cell in row)
 
 
-def _convert_xlsx(source_path: Path, output_path: Path) -> Tuple[str, Optional[str]]:
-    """
-    将 .xlsx 转换为 Markdown 表格（纯 openpyxl，无需外部工具）。
+# ============================================================
+# Markdown (.md) — 直接复制
+# ============================================================
 
-    保留工作表名称为二级标题，每个工作表转为 Markdown 表格。
-    自动过滤全空/全零的数据行，但不破坏 |---| 表头分割行。
-    """
+def _convert_md(source_path: Path, output_path: Path) -> Tuple[str, Optional[str], Optional[str]]:
     try:
-        from openpyxl import load_workbook
-
-        wb = load_workbook(str(source_path), read_only=True, data_only=True)
-        md_lines = []
-
-        for sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            md_lines.append(f"## {sheet_name}")
-            md_lines.append("")
-
-            rows = list(ws.iter_rows(values_only=True))
-            if not rows:
-                continue
-
-            # 表头行
-            headers = [str(c) if c is not None else "" for c in rows[0]]
-            md_lines.append("| " + " | ".join(headers) + " |")
-            md_lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
-
-            # 数据行：过滤掉全空/全零的垃圾行
-            data_rows = [row for row in rows[1:] if not _is_junk_row(row)]
-            for row in data_rows:
-                cells = [str(c) if c is not None else "" for c in row]
-                md_lines.append("| " + " | ".join(cells) + " |")
-
-            md_lines.append("")
-
-        wb.close()
-        md_content = "\n".join(md_lines).strip()
-        if not md_content:
-            return ("empty", "Excel 内容为空")
-
-        md_content = _clean_md_content(md_content)
-        if not md_content.strip():
-            return ("empty", "Excel 内容为空（移除了所有模板段落）")
-
+        content = source_path.read_text(encoding="utf-8")
+        if not content.strip():
+            return ("empty", "文件内容为空", None)
+        if not is_file_readable(source_path):
+            return ("garbled", "源文件内容疑似乱码", None)
+        content = _clean_md_content(content)
+        if not content.strip():
+            return ("empty", "文件内容为空（移除了所有模板段落）", None)
         _ensure_output_dir(output_path)
-        output_path.write_text(md_content, encoding="utf-8")
-
-        return ("ok", None)
-
-    except ImportError:
-        return ("error", "缺少 openpyxl 库，请执行: uv pip install openpyxl")
+        output_path.write_text(content, encoding="utf-8")
+        warning = _check_md_size(output_path)
+        return ("ok", None, warning)
     except Exception as e:
-        return ("error", f"{type(e).__name__}: {e}")
+        return ("error", f"{type(e).__name__}: {e}", None)
 
 
 # ============================================================
-# 转换调度器注册表
+# 纯文本 (.txt) — 支持编码回退
 # ============================================================
 
-_CONVERTER_REGISTRY = {
-    ".docx": _convert_docx,
-    ".md":   _convert_md,
-    ".pdf":  _convert_pdf,
-    ".txt":  _convert_txt,
-    ".pptx": _convert_pptx,
-    ".xlsx": _convert_xlsx,
+_TXT_ENCODINGS = ["utf-8", "gbk", "gb2312", "gb18030", "latin-1"]
+
+
+def _convert_txt(source_path: Path, output_path: Path) -> Tuple[str, Optional[str], Optional[str]]:
+    for enc in _TXT_ENCODINGS:
+        try:
+            content = source_path.read_text(encoding=enc)
+            if content.strip():
+                break
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    else:
+        return ("error", f"无法用 {', '.join(_TXT_ENCODINGS)} 解码文件内容", None)
+    if not content.strip():
+        return ("empty", "文件内容为空", None)
+    content = _clean_md_content(content)
+    if not content.strip():
+        return ("empty", "文件内容为空（移除了所有模板段落）", None)
+    _ensure_output_dir(output_path)
+    output_path.write_text(content, encoding="utf-8")
+    warning = _check_md_size(output_path)
+    return ("ok", None, warning)
+
+
+# ============================================================
+# 原生降级调度器
+# ============================================================
+
+_FALLBACK_REGISTRY = {
+    ".docx": _docx_fallback,
+    ".pdf":  _pdf_fallback,
+    ".xlsx": _xlsx_fallback,
+    ".pptx": _pptx_fallback,
 }
 
 
@@ -615,13 +535,14 @@ def convert_single_file(source_path: Path) -> dict:
     Returns
     -------
     dict: {
-        "rel_path": "relative/path/file.docx",
+        "rel_path": ...,
         "status": "ok" | "garbled" | "empty" | "error" | "skip",
-        "md_path": "output_md/relative/path.md" | None,
-        "error": str | None,
-        "sha256": str,
-        "size": int,
-        "mtime": str,
+        "md_path": ... | None,
+        "error": ... | None,
+        "warning": ... | None,
+        "sha256": ...,
+        "size": ...,
+        "mtime": ...,
     }
     """
     rel_path = _get_rel_path(source_path)
@@ -631,13 +552,13 @@ def convert_single_file(source_path: Path) -> dict:
         "status": "error",
         "md_path": None,
         "error": None,
+        "warning": None,
         "sha256": "",
         "size": 0,
         "mtime": "",
     }
 
     try:
-        # 基本信息
         stat = source_path.stat()
         result["size"] = stat.st_size
         result["sha256"] = compute_sha256(source_path)
@@ -646,21 +567,56 @@ def convert_single_file(source_path: Path) -> dict:
         dt = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
         result["mtime"] = dt.isoformat(timespec="seconds")
 
-        # 查找转换器
-        converter = _CONVERTER_REGISTRY.get(ext)
-        if converter is None:
-            # 不支持格式 → 仅打印文件名到日志，明确提示
+        if ext not in SUPPORTED_EXTENSIONS:
             result["status"] = "skip"
-            result["error"] = f"不支持的格式 {ext}，忽略文件: {rel_path}"
+            result["error"] = f"不支持格式 {ext}，忽略: {rel_path}"
             return result
 
-        # 执行转换
         output_path = _get_output_md_path(source_path)
-        status, error = converter(source_path, output_path)
 
-        result["status"] = status
-        result["error"] = error
-        if status == "ok":
+        # ── 策略：Docling 主力(docx/pdf) → 原生降级(xlsx/pptx) → 直接复制(md/txt) ──
+        if ext in _DOCLING_SUPPORTED:
+            # 主力：Docling
+            status, error, warning = _convert_with_docling(source_path, output_path)
+            if status == "ok":
+                result["status"] = status
+                result["error"] = error
+                result["warning"] = warning
+            else:
+                # Docling 失败 → 降级到原生解析器
+                fallback = _FALLBACK_REGISTRY.get(ext)
+                if fallback:
+                    status_fb, error_fb = fallback(source_path, output_path)
+                    if status_fb == "ok":
+                        result["status"] = status_fb
+                        result["error"] = None
+                        result["warning"] = _check_md_size(output_path)
+                    else:
+                        result["status"] = status_fb
+                        result["error"] = error_fb
+                else:
+                    result["status"] = status
+                    result["error"] = error
+        elif ext in _FALLBACK_REGISTRY:
+            # xlsx/pptx：直接使用原生解析器
+            fallback = _FALLBACK_REGISTRY[ext]
+            status_fb, error_fb = fallback(source_path, output_path)
+            result["status"] = status_fb
+            result["error"] = error_fb
+            if status_fb == "ok":
+                result["warning"] = _check_md_size(output_path)
+        elif ext == ".md":
+            status, error, warning = _convert_md(source_path, output_path)
+            result["status"] = status
+            result["error"] = error
+            result["warning"] = warning
+        elif ext == ".txt":
+            status, error, warning = _convert_txt(source_path, output_path)
+            result["status"] = status
+            result["error"] = error
+            result["warning"] = warning
+
+        if result["status"] == "ok":
             result["md_path"] = output_path.relative_to(OUTPUT_MD_DIR).with_suffix(".md").as_posix()
 
     except Exception as e:
@@ -673,23 +629,7 @@ def convert_single_file(source_path: Path) -> dict:
 def convert_batch(file_paths: List[Path],
                   max_workers: int = CONVERT_WORKERS,
                   progress_callback=None) -> List[dict]:
-    """
-    批量转换文件，支持 Ctrl+C 中断。
-
-    Parameters
-    ----------
-    file_paths : List[Path]
-        要转换的源文件路径列表。
-    max_workers : int
-        并行线程数。
-    progress_callback : callable, optional
-        每完成一个文件的回调函数 fn(result_dict)。
-
-    Returns
-    -------
-    List[dict]
-        每个文件的结果字典列表。
-    """
+    """批量转换文件，支持 Ctrl+C 中断。"""
     results = []
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(convert_single_file, fp): fp for fp in file_paths}
@@ -705,6 +645,5 @@ def convert_batch(file_paths: List[Path],
             pool.shutdown(wait=False)
             raise
 
-    # 按 rel_path 排序，保证结果顺序稳定
     results.sort(key=lambda r: r["rel_path"])
     return results
