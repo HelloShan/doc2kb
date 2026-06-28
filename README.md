@@ -1,0 +1,191 @@
+# doc2kb 📄→🧠
+
+**文档→向量知识库统一流水线**
+
+将原始文档自动转换为 Markdown（含模板段落清洁），再构建成 LanceDB 向量知识库（RAG 可检索）。
+
+合并了 `convert_doc2md`（文档转换）与 `vmax-knowledge-db`（知识库构建）两个工程，**统一状态管理、增量更新、失败重试**。
+
+---
+
+## 🚀 快速开始
+
+### 1. 安装依赖
+
+```bash
+uv pip install -r requirements.txt
+
+# 如需 PDF 高质量转换（含布局分析）
+uv pip install docling
+```
+
+### 2. 准备文档目录
+
+```
+doc2kb/
+├── source_docs/          ← 把你的文档放这里 (docx/pdf/md/txt/pptx/xlsx)
+├── output_md/            ← 自动生成的 MD 文件
+├── my_vmax_knowledge.lancedb/  ← 输出的向量知识库
+└── pipeline_20260628.log ← 自动生成的日期日志
+```
+
+### 3. 运行流水线
+
+```bash
+# 完整流水线（增量：只处理变更和失败的文件）
+python doc_pipeline.py build
+
+# 全量重建（清空知识库从头来过）
+python doc_pipeline.py build --full
+
+# 仅文档转换
+python doc_pipeline.py build --convert-only
+
+# 仅向量入库
+python doc_pipeline.py build --ingest-only
+
+# 重试失败文件
+python doc_pipeline.py retry
+
+# 查看状态 / 失败清单 / 知识库统计
+python doc_pipeline.py status
+python doc_pipeline.py list-failed
+python doc_pipeline.py stats
+```
+
+---
+
+## 🏗 架构
+
+```
+source_docs/ (docx/pdf/md/txt/pptx/xlsx)
+     │
+     ▼
+┌─────────────────────────────────────┐
+│         doc_pipeline.py              │
+│  build / retry / status / list-*    │
+├─────────────────────────────────────┤
+│  convert.py ←→ validate.py ←→ ingest.py │
+│       ↕             ↕             ↕      │
+│  state.py (SHA256追踪 + JSON状态持久化)   │
+│  config.py (中心化配置)                   │
+└─────────────────────────────────────┘
+     │                       │
+     ▼                       ▼
+  output_md/          my_vmax_knowledge.lancedb/
+  (清洁后的 MD)       (向量知识库)
+```
+
+### 模块说明
+
+| 模块 | 职责 |
+|------|------|
+| **doc_pipeline.py** | CLI 入口，子命令分发，流水线编排 |
+| **config.py** | 所有可调参数中心化，支持环境变量覆盖 |
+| **state.py** | 每个文件的 SHA256 + 转换/入库状态追踪 |
+| **validate.py** | 文档乱码检测 |
+| **convert.py** | 6种格式 → MD 转换引擎 + 模板清洁 + xlsx空行过滤 |
+| **ingest.py** | MD → 分块 → 嵌入向量 → LanceDB 入库 |
+
+---
+
+## 🎯 核心功能
+
+### 格式转换（6 种核心格式）
+
+| 格式 | 转换器 | 说明 |
+|------|--------|------|
+| `.docx` | python-docx + ZIP回退 | 损坏文件自动降级提取纯文本 |
+| `.pdf` | pypdf / Docling | 损坏PDF友好报错 |
+| `.xlsx` | openpyxl | **自动过滤全空/全零行** |
+| `.pptx` | python-pptx | 每页幻灯片转为二级标题 |
+| `.md` | 复制+清洁 | 保留所有格式 |
+| `.txt` | **编码智能回退** | utf-8→gbk→gb2312→latin-1 |
+
+### MD 模板段落清洁
+
+转换后的 Markdown 自动移除常见模板化内容：
+
+| 类别 | 移除内容 |
+|------|----------|
+| 📋 **目录** | 含点线填充的编号行段落（如 `1.1 概述........5`） |
+| 📄 **封面** | 第一个标题之前的短文本块（标题、公司名等） |
+| ©️ **版权** | 版权声明、`© 2026`、`All rights reserved` |
+| 🏷 **版本** | `版本：V1.0`、修订记录、变更历史 |
+| ✍️ **作者** | `作者：`、`审核：`、`批准：`、`编制：` |
+| 📄 **页码** | `第 1 页`、`— 1 —` |
+
+> **安全设计**：仅移除**行首/单独成行**的模板关键词，行内出现的不误删（如"本文作者是张三"保留）。
+
+### xlsx 表格空行过滤
+
+过滤三种垃圾行且**不破坏 `| --- |` 分割行**：
+
+| 原始行 | 是否过滤 |
+|--------|:--------:|
+| `|  |  |  |`（全空） | ✅ |
+| `| 0 | 0 | 0 |`（全零） | ✅ |
+| `|  | 0 |  |`（混合空） | ✅ |
+| `| 西瓜 | 3 | 15 |`（有效数据） | ❌ |
+
+### 文件变更追踪
+
+每个源文件记录 **SHA256** 哈希，文件修改后自动重新处理，旧版本向量自动从 LanceDB 删除。
+
+### 乱码检测
+
+PDF→MD 转换后自动检测，通过中文标点计数 + 模板匹配 + ASCII 单词兜底三重判断。
+
+---
+
+## ⚙️ 配置项（config.py）
+
+| 配置 | 默认值 | 说明 |
+|------|--------|------|
+| `SOURCE_DIR` | `./source_docs` | 源文档目录 |
+| `OUTPUT_MD_DIR` | `./output_md` | MD 输出目录 |
+| `DB_PATH` | `./my_vmax_knowledge.lancedb` | LanceDB 路径 |
+| `LOG_FILE` | `pipeline_YYYYMMDD.log` | 日志文件（按日期） |
+| `CONVERT_WORKERS` | 2 | 并行线程数 |
+| `CHUNK_SIZE` | 1200 | 分块字符数 |
+| `CHUNK_OVERLAP` | 300 | 块重叠字符数 |
+| `EMBEDDING_MODEL` | `bge-small-zh-v1.5` | 嵌入模型 |
+| `LARGE_FILE_THRESHOLD_MB` | 50 | 跳过超大文件 |
+
+所有配置项可通过 `VMAX_` 前缀环境变量覆盖。
+
+---
+
+## 🪟 兼容性 & 最低配置
+
+- **操作系统**: Windows 11 / Linux / macOS
+- **CPU**: 2 线程
+- **内存**: 2GB
+- **依赖**: 纯 Python 包，无需系统级工具
+
+---
+
+## 🔄 典型工作流
+
+```bash
+# 日常增量更新：放入新文档 → 运行
+python doc_pipeline.py build
+
+# 全量重建
+python doc_pipeline.py build --full
+
+# 排查失败
+python doc_pipeline.py status
+python doc_pipeline.py list-failed
+python doc_pipeline.py retry
+
+# 分步调试
+python doc_pipeline.py build --convert-only  # 只看转换
+python doc_pipeline.py build --ingest-only   # 只看入库
+```
+
+---
+
+## 📝 License
+
+MIT

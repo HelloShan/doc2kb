@@ -1,0 +1,614 @@
+#!/usr/bin/env python3
+"""
+doc2kb — 统一文档流水线 CLI
+==============================
+合并 convert_doc2md + vmax-knowledge-db 的统一工程。
+
+将原始文档（docx/pdf/md/txt/pptx）→ Markdown → LanceDB 向量知识库，
+使用 SHA256 追踪文件变更，支持增量/全量/重试等多种模式。
+
+用法
+----
+  # 完整流水线（增量模式：只处理变更和失败的文件）
+  python doc_pipeline.py build
+
+  # 完整流水线（全量重建）
+  python doc_pipeline.py build --full
+
+  # 仅进行文档转换（docx/pdf → md）
+  python doc_pipeline.py build --convert-only
+
+  # 仅进行向量入库（处理已有 .md 文件）
+  python doc_pipeline.py build --ingest-only
+
+  # 重试所有失败的文件
+  python doc_pipeline.py retry
+
+  # 仅重试转换失败的
+  python doc_pipeline.py retry --convert
+
+  # 仅重试入库失败的
+  python doc_pipeline.py retry --ingest
+
+  # 查看流水线状态汇总
+  python doc_pipeline.py status
+
+  # 列出失败文件明细
+  python doc_pipeline.py list-failed
+
+  # 查看知识库统计
+  python doc_pipeline.py stats
+
+跨平台：支持 Windows 11 / Linux / macOS
+最低配置：2 线程, 2GB 内存
+"""
+
+import argparse
+import sys
+import time
+import os
+import signal
+from pathlib import Path
+from datetime import datetime
+from typing import List, Tuple
+
+# 确保 Ctrl+C 能中断 Python 代码（解决 ThreadPoolExecutor 不响应的问题）
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+# 确保项目根目录在 sys.path 中
+_SCRIPT_DIR = Path(__file__).parent.absolute()
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from config import (
+    SOURCE_DIR, OUTPUT_MD_DIR, DB_PATH, STATE_FILE, LOG_FILE,
+    SUPPORTED_EXTENSIONS, CONVERT_WORKERS, COLOR_OUTPUT,
+    validate_config,
+)
+from state import (
+    PipelineState, compute_sha256, collect_files,
+    ST_OK, ST_SKIP, ST_GARBLED, ST_EMPTY, ST_ERROR, ST_PENDING,
+    RETRYABLE_STATUSES,
+)
+from convert import convert_single_file
+from ingest import (
+    ingest_single_md, rebuild_table, get_db_stats, close_db
+)
+
+
+# ============================================================
+# 日志工具
+# ============================================================
+
+class Logger:
+    """简易彩色日志器"""
+
+    def __init__(self, color: bool = COLOR_OUTPUT, log_path: Path = None):
+        self._color = color and sys.stdout.isatty()
+        self._log_file = open(log_path, "a", encoding="utf-8") if log_path else None
+
+    def _ts(self) -> str:
+        return datetime.now().strftime("%H:%M:%S")
+
+    def _c(self, code: str, text: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if self._color else text
+
+    def info(self, msg: str):
+        line = f"[{self._ts()}] {msg}"
+        print(line, file=sys.stderr)
+        if self._log_file:
+            self._log_file.write(line + "\n")
+            self._log_file.flush()
+
+    def ok(self, msg: str):
+        line = f"[{self._ts()}] {self._c('32', '✓')} {msg}"
+        print(line, file=sys.stderr)
+        if self._log_file:
+            self._log_file.write(f"[{self._ts()}] OK {msg}\n")
+            self._log_file.flush()
+
+    def warn(self, msg: str):
+        line = f"[{self._ts()}] {self._c('33', '⚠')} {msg}"
+        print(line, file=sys.stderr)
+        if self._log_file:
+            self._log_file.write(f"[{self._ts()}] WARN {msg}\n")
+            self._log_file.flush()
+
+    def err(self, msg: str):
+        line = f"[{self._ts()}] {self._c('31', '✗')} {msg}"
+        print(line, file=sys.stderr)
+        if self._log_file:
+            self._log_file.write(f"[{self._ts()}] ERROR {msg}\n")
+            self._log_file.flush()
+
+    def close(self):
+        if self._log_file:
+            self._log_file.close()
+
+
+# ============================================================
+# 进度统计
+# ============================================================
+
+class ProgressStats:
+    """跟踪流水线各阶段的统计"""
+
+    def __init__(self):
+        self.convert = {"ok": 0, "skip": 0, "garbled": 0, "empty": 0, "error": 0, "pending": 0, "total": 0}
+        self.ingest = {"ok": 0, "skip": 0, "garbled": 0, "empty": 0, "error": 0, "pending": 0, "total": 0}
+        self.total_chunks = 0
+
+    def convert_done(self, result: dict):
+        st = result["status"]
+        if st in self.convert:
+            self.convert[st] += 1
+        self.convert["total"] += 1
+
+    def ingest_done(self, result: dict):
+        st = result["status"]
+        if st in self.ingest:
+            self.ingest[st] += 1
+        self.ingest["total"] += 1
+        if result.get("chunks"):
+            self.total_chunks += result["chunks"]
+
+    def summary(self) -> str:
+        conv = self.convert
+        ing = self.ingest
+        return (
+            f"  转换: {conv['ok']} OK, {conv['skip']} 跳过, "
+            f"{conv['garbled']} 乱码, {conv['empty']} 空, "
+            f"{conv['error']} 错误 / 共{conv['total']}文件\n"
+            f"  入库: {ing['ok']} OK, {ing['skip']} 跳过, "
+            f"{ing['garbled']} 乱码, {ing['empty']} 空, "
+            f"{ing['error']} 错误 / 共{ing['total']}文件, "
+            f"总计 {self.total_chunks} 个向量分块"
+        )
+
+
+# ============================================================
+# 核心流水线逻辑
+# ============================================================
+
+def run_build(args, log: Logger):
+    """执行 build 子命令"""
+
+    is_full = args.full
+    convert_only = args.convert_only
+    ingest_only = args.ingest_only
+
+    if is_full:
+        log.warn("全量重建模式：将清空现有知识库并重新处理所有文件")
+
+    log.info(f"源文档目录: {SOURCE_DIR}")
+    log.info(f"MD输出目录: {OUTPUT_MD_DIR}")
+    log.info(f"知识库路径: {DB_PATH}")
+    log.info(f"状态文件:   {STATE_FILE}")
+    log.info(f"并行线程:   {CONVERT_WORKERS}")
+    log.info("")
+
+    # 创建必要的目录
+    SOURCE_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_MD_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 加载状态
+    state = PipelineState(STATE_FILE)
+    stats = ProgressStats()
+
+    # 扫描源文件
+    log.info("🔍 扫描源文件...")
+    all_files = collect_files(SOURCE_DIR, SUPPORTED_EXTENSIONS)
+    log.info(f"   找到 {len(all_files)} 个源文件")
+
+    if not all_files:
+        log.warn("源目录中没有支持的文档文件")
+        log.info(f"支持的格式: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
+        return
+
+    # ── 全量重建：清空状态和知识库 ──
+    if is_full:
+        log.info("🗑  清空状态和知识库...")
+        # 删除旧的状态文件
+        if STATE_FILE.exists():
+            STATE_FILE.unlink()
+        # 重建 LanceDB 表
+        rebuild_table()
+        state = PipelineState(STATE_FILE)
+        log.ok("已清空，准备全量重建")
+        log.info("")
+
+    # ── 确定待处理的文件列表 ──
+    files_to_convert = []
+    files_to_ingest = []
+
+    for fp in all_files:
+        rel = fp.relative_to(SOURCE_DIR).as_posix()
+        sha256 = compute_sha256(fp)
+        stat = fp.stat()
+        from datetime import datetime, timezone
+        mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(timespec="seconds")
+
+        if is_full:
+            # 全量模式：所有文件都需要处理
+            state.init_file(rel, sha256, stat.st_size, mtime)
+            if not convert_only and not ingest_only:
+                files_to_convert.append(fp)
+            elif convert_only:
+                files_to_convert.append(fp)
+        else:
+            # 增量模式：只处理变更或失败的文件
+            if state.needs_rebuild(rel, sha256):
+                state.init_file(rel, sha256, stat.st_size, mtime)
+                if not ingest_only:
+                    files_to_convert.append(fp)
+            else:
+                # 文件未变更，标记为跳过
+                state.init_file(rel, sha256, stat.st_size, mtime)
+
+    # 入库文件列表：
+    # 如果 ingest_only，从状态中找所有已完成转换但未入库的文件
+    if ingest_only:
+        for fp in all_files:
+            rel = fp.relative_to(SOURCE_DIR).as_posix()
+            if state.is_convert_done(rel) and not state.is_ingest_done(rel):
+                md_path = OUTPUT_MD_DIR / Path(rel).with_suffix(".md")
+                if md_path.exists():
+                    files_to_ingest.append((md_path, rel, state.get_file_sha256(rel)))
+        log.info(f"  待入库（仅新建入库）: {len(files_to_ingest)} 个 MD 文件")
+    elif not convert_only:
+        # 正常流水线：转换完还要入库
+        if is_full:
+            for fp in all_files:
+                rel = fp.relative_to(SOURCE_DIR).as_posix()
+                md_path = OUTPUT_MD_DIR / Path(rel).with_suffix(".md")
+                if md_path.exists():
+                    files_to_ingest.append((md_path, rel, state.get_file_sha256(rel)))
+            log.info(f"  待入库（全量）: {len(files_to_ingest)} 个 MD 文件")
+        # 增量入库在转换完成后自动添加
+
+    # ── Stage 1: 文档转换 ──
+    if files_to_convert and not ingest_only:
+        log.info(f"\n📄 阶段 1/2: 文档转换 ({len(files_to_convert)} 个文件)...")
+        t0 = time.time()
+
+        from convert import convert_batch
+        conv_results = convert_batch(
+            files_to_convert,
+            max_workers=CONVERT_WORKERS,
+            progress_callback=lambda r: _on_convert_done(r, state, stats, log),
+        )
+
+        elapsed = time.time() - t0
+        log.info(f"\n转换完成: {elapsed:.1f}s")
+        log.info(stats.summary())
+
+        # 收集成功转换的 MD 文件，准备下一阶段
+        if not convert_only:
+            for r in conv_results:
+                if r["status"] == "ok" and r["md_path"]:
+                    md_abs = OUTPUT_MD_DIR / r["md_path"]
+                    files_to_ingest.append((md_abs, r["rel_path"], r["sha256"]))
+
+    # ── Stage 2: 向量入库 ──
+    if files_to_ingest and not convert_only:
+        log.info(f"\n🧠 阶段 2/2: 向量入库 ({len(files_to_ingest)} 个文件)...")
+        t0 = time.time()
+
+        from ingest import ingest_batch
+        ing_results = ingest_batch(
+            files_to_ingest,
+            max_workers=CONVERT_WORKERS,
+            progress_callback=lambda r: _on_ingest_done(r, state, stats, log),
+        )
+
+        elapsed = time.time() - t0
+        log.info(f"\n入库完成: {elapsed:.1f}s")
+        log.info(stats.summary())
+
+    # ── 最终保存状态 ──
+    state.save()
+
+    # ── 汇总报告 ──
+    _print_final_report(state, stats, log)
+
+
+def _on_convert_done(result: dict, state: PipelineState,
+                     stats: ProgressStats, log: Logger):
+    """单个文件转换完成的回调"""
+    rel = result["rel_path"]
+    status = result["status"]
+    error = result.get("error")
+
+    state.update_conversion(rel, status,
+                            md_path=result.get("md_path"),
+                            error=error)
+    stats.convert_done(result)
+
+    if status == "ok":
+        pass  # 静默成功
+    elif status == "skip":
+        log.warn(f"  跳过 {rel}: {error}")
+    elif status == "garbled":
+        log.err(f"  乱码 {rel}: {error}")
+    elif status == "empty":
+        log.warn(f"  空文件 {rel}: {error}")
+    else:
+        log.err(f"  失败 {rel}: {error}")
+
+
+def _on_ingest_done(result: dict, state: PipelineState,
+                    stats: ProgressStats, log: Logger):
+    """单个文件入库完成的回调"""
+    rel = result["rel_path"]
+    status = result["status"]
+    error = result.get("error")
+
+    state.update_ingestion(rel, status,
+                           chunks=result.get("chunks", 0),
+                           error=error)
+    stats.ingest_done(result)
+
+    if status == "ok":
+        pass  # 静默成功
+    else:
+        log.err(f"  入库失败 {rel}: {error}")
+
+
+def _print_final_report(state: PipelineState, stats: ProgressStats,
+                        log: Logger):
+    """打印最终汇总报告"""
+    summary = state.get_summary()
+    log.info("")
+    log.info("=" * 60)
+    log.info("📊 流水线执行完毕")
+    log.info("=" * 60)
+    log.info(f"  源文件总数:    {summary['total']}")
+    log.info("")
+    log.info("  转换状态:")
+    for st, count in summary["conversion"].items():
+        if count > 0:
+            log.info(f"    {st}: {count}")
+    log.info("")
+    log.info("  入库状态:")
+    for st, count in summary["ingestion"].items():
+        if count > 0:
+            log.info(f"    {st}: {count}")
+    log.info("")
+    log.info(f"  向量分块总数: {stats.total_chunks}")
+
+    # 检查是否有失败的文件
+    failed = state.get_failed_files("all")
+    if failed:
+        log.warn(f"\n⚠  有 {len(failed)} 个文件存在失败状态")
+        log.info("   使用 'python doc_pipeline.py list-failed' 查看详情")
+        log.info("   使用 'python doc_pipeline.py retry' 重试")
+
+    # 知识库统计
+    try:
+        db_stats = get_db_stats()
+        if "total_chunks" in db_stats:
+            log.info(f"\n📚 知识库: {db_stats['total_chunks']} 个向量分块")
+    except Exception:
+        pass
+
+    log.info("=" * 60)
+
+
+# ============================================================
+# retry 子命令
+# ============================================================
+
+def run_retry(args, log: Logger):
+    """重试失败的文件"""
+    state = PipelineState(STATE_FILE)
+    stage = "conversion" if args.convert else ("ingestion" if args.ingest else "all")
+
+    failed = state.get_failed_files(stage)
+    if not failed:
+        log.ok("没有需要重试的文件")
+        return
+
+    log.info(f"找到 {len(failed)} 个需要重试的文件（阶段: {stage}）")
+
+    # 重置状态
+    for rel, _ in failed:
+        state.reset_file(rel)
+    state.save()
+
+    # 构造伪 args 调用 build
+    class FakeArgs:
+        full = False
+        convert_only = False
+        ingest_only = False
+        retry = False
+
+    run_build(FakeArgs(), log)
+
+
+# ============================================================
+# status 子命令
+# ============================================================
+
+def run_status(args, log: Logger):
+    """查看流水线状态"""
+    if not STATE_FILE.exists():
+        log.info("流水线尚未运行过，没有状态记录")
+        return
+
+    state = PipelineState(STATE_FILE)
+    summary = state.get_summary()
+
+    log.info("📊 流水线状态汇总")
+    log.info(f"  状态文件:   {STATE_FILE}")
+    log.info(f"  源文件总数: {summary['total']}")
+    log.info("")
+    log.info("  转换阶段:")
+    for st in ["ok", "skip", "garbled", "empty", "error", "pending"]:
+        count = summary["conversion"].get(st, 0)
+        if count > 0:
+            log.info(f"    {st}: {count}")
+    log.info("")
+    log.info("  入库阶段:")
+    for st in ["ok", "skip", "error", "pending"]:
+        count = summary["ingestion"].get(st, 0)
+        if count > 0:
+            log.info(f"    {st}: {count}")
+
+    # 知识库统计
+    try:
+        db_stats = get_db_stats()
+        if "total_chunks" in db_stats:
+            log.info(f"\n📚 知识库:")
+            log.info(f"   路径: {db_stats['path']}")
+            log.info(f"   向量维度: {db_stats['vector_dim']}")
+            log.info(f"   分块总数: {db_stats['total_chunks']}")
+            log.info(f"   模型: {db_stats['model']}")
+    except Exception as e:
+        log.info(f"\n📚 知识库: 无法读取 ({e})")
+
+    # 失败文件
+    failed = state.get_failed_files("all")
+    if failed:
+        log.warn(f"\n⚠  存在 {len(failed)} 个失败文件")
+        log.info("   使用 'python doc_pipeline.py list-failed' 查看明细")
+
+
+# ============================================================
+# list-failed 子命令
+# ============================================================
+
+def run_list_failed(args, log: Logger):
+    """列出失败文件"""
+    state = PipelineState(STATE_FILE)
+
+    conv_failed = state.get_failed_files("conversion")
+    ing_failed = state.get_failed_files("ingestion")
+
+    # 去重：先列出唯一文件
+    seen = set()
+
+    log.info("❌ 失败文件列表")
+    log.info("")
+
+    for rel, entry in conv_failed:
+        seen.add(rel)
+        conv = entry.get("conversion", {})
+        log.err(f"  [{conv.get('status', '?')}] 转换: {rel}")
+        if conv.get("error"):
+            log.info(f"       原因: {conv['error']}")
+
+    for rel, entry in ing_failed:
+        if rel in seen:
+            ing = entry.get("ingestion", {})
+            log.err(f"  [{ing.get('status', '?')}] 入库: {rel}")
+            if ing.get("error"):
+                log.info(f"       原因: {ing['error']}")
+        else:
+            seen.add(rel)
+            ing = entry.get("ingestion", {})
+            log.err(f"  [{ing.get('status', '?')}] 入库: {rel}")
+            if ing.get("error"):
+                log.info(f"       原因: {ing['error']}")
+
+    if not seen:
+        log.ok("没有失败文件")
+
+    log.info("")
+    log.info(f"共 {len(seen)} 个失败文件")
+    log.info("使用 'python doc_pipeline.py retry' 重试所有失败文件")
+
+
+# ============================================================
+# stats 子命令
+# ============================================================
+
+def run_stats(args, log: Logger):
+    """查看知识库统计"""
+    try:
+        db_stats = get_db_stats()
+        if "error" in db_stats:
+            log.err(f"无法读取知识库: {db_stats['error']}")
+            return
+        log.info("📚 知识库统计")
+        log.info(f"  路径:      {db_stats['path']}")
+        log.info(f"  表名:      {db_stats['table']}")
+        log.info(f"  向量维度:  {db_stats['vector_dim']}")
+        log.info(f"  分块总数:  {db_stats['total_chunks']}")
+        log.info(f"  嵌入模型:  {db_stats['model']}")
+    except Exception as e:
+        log.err(f"无法读取知识库: {e}")
+
+
+# ============================================================
+# CLI 入口
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="doc2kb",
+        description="doc2kb — 文档转换→向量知识库统一流水线",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="子命令")
+
+    # build
+    build_p = subparsers.add_parser("build", help="执行完整流水线（转换+入库）")
+    build_p.add_argument("--full", action="store_true",
+                         help="全量重建：清空现有知识库，重新处理所有文件")
+    build_p.add_argument("--convert-only", action="store_true",
+                         help="仅进行文档转换（不执行向量入库）")
+    build_p.add_argument("--ingest-only", action="store_true",
+                         help="仅进行向量入库（已转换的 .md 文件入库到 LanceDB）")
+
+    # retry
+    retry_p = subparsers.add_parser("retry", help="重试所有失败的文件")
+    retry_p.add_argument("--convert", action="store_true",
+                         help="仅重试转换失败的")
+    retry_p.add_argument("--ingest", action="store_true",
+                         help="仅重试入库失败的")
+
+    # status
+    subparsers.add_parser("status", help="查看流水线状态汇总")
+
+    # list-failed
+    subparsers.add_parser("list-failed", help="列出所有失败的文件")
+
+    # stats
+    subparsers.add_parser("stats", help="查看知识库统计")
+
+    args = parser.parse_args()
+
+    # 初始化日志
+    log = Logger(color=COLOR_OUTPUT, log_path=LOG_FILE)
+
+    try:
+        if args.command == "build":
+            validate_config()
+            run_build(args, log)
+        elif args.command == "retry":
+            run_retry(args, log)
+        elif args.command == "status":
+            run_status(args, log)
+        elif args.command == "list-failed":
+            run_list_failed(args, log)
+        elif args.command == "stats":
+            run_stats(args, log)
+        else:
+            parser.print_help()
+    except KeyboardInterrupt:
+        log.warn("\n用户中断")
+        sys.exit(1)
+    except Exception as e:
+        import traceback
+        log.err(f"未预期的错误: {e}")
+        log.info(traceback.format_exc())
+        sys.exit(1)
+    finally:
+        close_db()
+        log.close()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.log
+output_md/
+my_vmax_knowledge.lancedb/
+source_docs/
+pipeline_state.json
+.DS_Store
