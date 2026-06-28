@@ -13,13 +13,29 @@ last_updated: 2026-06-29
 > 此 skill 随 [doc2kb](https://github.com/HelloShan/doc2kb) 项目一起分发。
 > 使用前请确保已运行 `python doc_pipeline.py build` 构建好知识库。
 
-## 配置项
+## 依赖安装
 
-| 环境变量 | 默认值 | 说明 |
-|----------|--------|------|
+```bash
+pip install fastembed lancedb pyarrow
+```
+
+## 配置
+
+### LanceDB 知识库路径
+
+skill 自动读取 doc2kb 项目 `config.py` 中的路径配置，无需额外设置。
+如需覆盖，可通过环境变量指定：
+
+| 环境变量 | 默认值（来自 config.py） | 说明 |
+|----------|--------------------------|------|
+| `DOC2KB_DB_PATH` | `../doc2kb.lancedb` | LanceDB 向量库路径 |
 | `DOC2KB_QA_SERVER_HOST` | `127.0.0.1` | 检索 server 地址 |
 | `DOC2KB_QA_SERVER_PORT` | `8788` | 检索 server 端口 |
-| `DOC2KB_QA_SERVER_IDLE_TIMEOUT` | `3600` | 空闲超时秒数 |
+| `DOC2KB_QA_SERVER_IDLE_TIMEOUT` | `3600` | 空闲超时秒数（1h 无请求自动退出） |
+
+### 嵌入模型
+
+默认使用 `BAAI/bge-small-zh-v1.5`（512 维，CPU 运行），首次运行自动下载。
 
 ## 🔴 核心铁律
 
@@ -32,20 +48,28 @@ last_updated: 2026-06-29
 ## 启动 server
 
 ```bash
-cd /opt/data/doc2kb
-python3 query/server.py --server
+cd /path/to/doc2kb
+python3 skill_query/server.py --server
 ```
 
 ## 查询
 
 ```bash
-cd /opt/data/doc2kb
+cd /path/to/doc2kb
 
 # 单题查询
-python3 query/server.py --question "你的问题" --top-k 5 --format json
+python3 skill_query/server.py --question "你的问题" --top-k 5 --format json
 
 # 上下文格式（对话友好）
-python3 query/server.py --question "你的问题" --format context
+python3 skill_query/server.py --question "你的问题" --format context
+
+# 批量查询
+python3 skill_query/server.py --batch '[{"id":"1","question":"问题A"}]'
+
+# HTTP API
+curl http://127.0.0.1:8788/health
+curl -X POST http://127.0.0.1:8788/ \
+  -d '{"action":"search","question":"你的问题","top_k":5}'
 ```
 
 ## 返回格式
@@ -56,6 +80,8 @@ python3 query/server.py --question "你的问题" --format context
   "results": [
     {"text": "匹配原文...", "file_name": "文档.md", "similarity": 0.89}
   ],
+  "hits": 5,
+  "best_similarity": 0.8901,
   "confidence": "high"
 }
 ```
@@ -67,10 +93,11 @@ python3 query/server.py --question "你的问题" --format context
 - `0.70 ≤ similarity < 0.85` → 中置信度，建议交叉验证
 - `similarity < 0.70` → 低置信度，需声明
 - ❌ 知识库无覆盖 → 如实说"知识库未覆盖"，禁止脑补
+- ❌ 不准降级到 `search_files` / `grep` 直接搜 MD 文件
 
 ## Pitfalls
 
 1. **禁止直接搜 MD 文件** — 任何场景下不准用 `search_files` / `grep` / `read_file`
-2. **端口 8788** — 独立于 VMAX 的 8787，可同时运行
-3. **冷启动 ~5s** — 首次查询加载模型，后续毫秒级
-4. **必须先 build** — 无知识库时所有查询报错
+2. **冷启动 ~5s** — 首次查询加载模型，后续查询毫秒级
+3. **必须先 build** — 无知识库时所有查询报错
+4. **端口 8788** — 如端口冲突，设 `DOC2KB_QA_SERVER_PORT` 换一个
