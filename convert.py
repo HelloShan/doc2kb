@@ -115,19 +115,29 @@ def detect_docm(file_path: Path) -> tuple[bool, str]:
 
 
 def detect_broken_pdf(file_path: Path) -> tuple[bool, str]:
-    """检查 PDF 文件是否可读。"""
+    """检查 PDF 文件是否可读（静默模式，压制 pypdf 的 stderr 和日志噪音）。"""
+    import logging
+    import contextlib
+
     if file_path.suffix.lower() != '.pdf':
         return False, ''
     try:
         from pypdf import PdfReader, errors as pypdf_errors
+        # 静默 pypdf 的日志和 stderr 噪音（如 incorrect startxref pointer）
+        logger = logging.getLogger('pypdf')
+        old_level = logger.level
+        logger.setLevel(logging.ERROR)
         try:
-            reader = PdfReader(str(file_path))
-            _ = len(reader.pages)
+            with contextlib.redirect_stderr(open(os.devnull, 'w')):
+                reader = PdfReader(str(file_path))
+                _ = len(reader.pages)
             return False, ''
         except pypdf_errors.PdfStreamError:
             return True, 'PDF 流意外结束（文件损坏或不完整）'
         except Exception as e:
             return True, f'PDF 读取失败: {type(e).__name__}'
+        finally:
+            logger.setLevel(old_level)
     except ImportError:
         return False, ''
 
