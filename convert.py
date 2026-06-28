@@ -484,6 +484,21 @@ def _clean_md_content(content: str) -> str:
         i += 1
 
     cleaned = '\n'.join(result_lines)
+
+    # ═══ 兜底核弹清洁 ═══
+    #  清理 _compact_table_block 可能遗漏的表格垃圾
+    #  1) 纯空行 & 纯 --- 行 → 整行删除
+    cleaned = re.sub(r'^\|(?:\s*\|\s*)*\|\s*$', '', cleaned, flags=re.M)
+    #  2) 空行边界合并（删除空表后可能留的多余空行）
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    #  3) 每个表格行尾部空单元格截断：| a | b |   |   | → | a | b |
+    #     去掉行尾连续的 | (空格) 模式
+    cleaned = re.sub(r'(?<=\|)(?:\s*\|\s*)*$', '', cleaned, flags=re.M)
+    #  4) 去掉前导空单元格：|   |   | a | b | → | a | b |
+    cleaned = re.sub(r'^\|(?:\s*\|\s*)*\s*(?=\S)', '| ', cleaned, flags=re.M)
+    #  5) 清理残留的孤立空单元格（行中连续多个空格|）  
+    cleaned = re.sub(r'\|\s*\|\s*(?=\|)', '| ', cleaned)
+
     cleaned = re.sub(r'\n{4,}', '\n\n\n', cleaned)
     return cleaned.strip()
 
