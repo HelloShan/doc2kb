@@ -6,3 +6,4 @@ my_vmax_knowledge.lancedb/
 source_docs/
 pipeline_state.json
 .DS_Store
+__pycache__
