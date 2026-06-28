@@ -324,7 +324,24 @@ def _compact_table_block(lines: list[str]) -> list[str]:
                     break
         if all_junk:
             return []
-        return lines  # 不是标准表格，跳过
+        # 有内容行但仍可能有尾部空单元格，独立修剪
+        out = []
+        for line in lines:
+            cells = line.split('|')
+            if len(cells) < 3:
+                out.append(line)
+                continue
+            cc = [c.strip() for c in cells[1:-1]]
+            # 去掉尾部空单元格
+            while cc and not cc[-1]:
+                cc.pop()
+            # 去掉尾部纯零单元格
+            while cc and all(c == '0' for c in cc[-1:]):
+                cc.pop()
+            if _is_junk_row(cc):
+                continue
+            out.append('| ' + ' | '.join(cc) + ' |')
+        return out
 
     if sep_col_count <= 1:
         return lines  # 单列分隔线，不处理
