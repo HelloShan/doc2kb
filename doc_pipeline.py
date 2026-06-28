@@ -68,7 +68,7 @@ from state import (
     ST_OK, ST_SKIP, ST_GARBLED, ST_EMPTY, ST_ERROR, ST_PENDING,
     RETRYABLE_STATUSES,
 )
-from convert import convert_single_file
+from convert import convert_single_file, scan_compatibility
 from ingest import (
     ingest_single_md, rebuild_table, get_db_stats, close_db
 )
@@ -522,6 +522,33 @@ def run_list_failed(args, log: Logger):
 # stats 子命令
 # ============================================================
 
+def run_check(args, log: Logger):
+    """扫描源目录，检查文件兼容性"""
+    log.info("🔍 扫描文件兼容性...")
+    log.info(f"  源目录: {SOURCE_DIR}")
+
+    if not SOURCE_DIR.exists():
+        log.err(f"目录不存在: {SOURCE_DIR}")
+        return
+
+    problems = scan_compatibility(SOURCE_DIR)
+
+    if not problems:
+        log.ok("所有文档兼容，无问题文件")
+        return
+
+    log.warn(f"发现 {len(problems)} 个不兼容文件：")
+    log.info("")
+    for fp, reason in problems:
+        rel = fp.relative_to(SOURCE_DIR).as_posix()
+        size = fp.stat().st_size / 1024
+        log.info(f"  📄 {rel}  ({size:.0f} KB)")
+        log.info(f"     原因: {reason}")
+        log.info("")
+
+    log.warn(f"共 {len(problems)} 个文件需手工处理，处理后重新运行流水线。")
+
+
 def run_stats(args, log: Logger):
     """查看知识库统计"""
     try:
@@ -578,6 +605,9 @@ def main():
     # stats
     subparsers.add_parser("stats", help="查看知识库统计")
 
+    # check
+    subparsers.add_parser("check", help="扫描源目录，检查文件兼容性")
+
     args = parser.parse_args()
 
     # 初始化日志
@@ -593,6 +623,8 @@ def main():
             run_status(args, log)
         elif args.command == "list-failed":
             run_list_failed(args, log)
+        elif args.command == "check":
+            run_check(args, log)
         elif args.command == "stats":
             run_stats(args, log)
         else:

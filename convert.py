@@ -78,7 +78,6 @@ def _is_docm_file(source_path: Path) -> bool:
         with zipfile.ZipFile(str(source_path)) as z:
             ct = z.read('[Content_Types].xml')
             root = ET.fromstring(ct)
-            # 提取默认 namespace
             ns = root.tag.split('}')[0].strip('{') if '}' in root.tag else ''
             tag = f'{{{ns}}}Override' if ns else 'Override'
             for override in root.iter(tag):
@@ -88,6 +87,84 @@ def _is_docm_file(source_path: Path) -> bool:
         return False
     except Exception:
         return False
+
+
+# ============================================================
+# 兼容性检测（供 doc_pipeline.py check 子命令使用）
+# ============================================================
+
+def detect_docm(file_path: Path) -> tuple[bool, str]:
+    """检测 .docx 文件是否为宏文档 (.docm) 或旧版 .doc。返回 (是问题吗, 原因)。"""
+    if file_path.suffix.lower() not in ('.docx',):
+        return False, ''
+    try:
+        import zipfile
+        from xml.etree import ElementTree as ET
+        with zipfile.ZipFile(str(file_path)) as z:
+            ct = z.read('[Content_Types].xml')
+            root = ET.fromstring(ct)
+            ns = root.tag.split('}')[0].strip('{') if '}' in root.tag else ''
+            tag = f'{{{ns}}}Override' if ns else 'Override'
+            for override in root.iter(tag):
+                ct_type = override.get('ContentType', '')
+                if 'macroenabled' in ct_type.lower():
+                    return True, '宏文档 (.docm)，需用 Word 另存为 .docx'
+        return False, ''
+    except (zipfile.BadZipFile, Exception):
+        return True, '不是有效的 ZIP 包（可能是旧版 .doc 格式误标为 .docx）'
+
+
+def detect_broken_pdf(file_path: Path) -> tuple[bool, str]:
+    """检查 PDF 文件是否可读。"""
+    if file_path.suffix.lower() != '.pdf':
+        return False, ''
+    try:
+        from pypdf import PdfReader, errors as pypdf_errors
+        try:
+            reader = PdfReader(str(file_path))
+            _ = len(reader.pages)
+            return False, ''
+        except pypdf_errors.PdfStreamError:
+            return True, 'PDF 流意外结束（文件损坏或不完整）'
+        except Exception as e:
+            return True, f'PDF 读取失败: {type(e).__name__}'
+    except ImportError:
+        return False, ''
+
+
+def detect_broken_txt(file_path: Path) -> tuple[bool, str]:
+    """检查 .txt 文件编码是否无法识别。"""
+    if file_path.suffix.lower() != '.txt':
+        return False, ''
+    _TXT_ENCODINGS = ["utf-8", "gbk", "gb2312", "gb18030", "latin-1"]
+    for enc in _TXT_ENCODINGS:
+        try:
+            content = file_path.read_text(encoding=enc)
+            if content.strip():
+                return False, ''
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    return True, f'无法用常见编码 ({"/".join(_TXT_ENCODINGS)}) 解码'
+
+
+def scan_compatibility(directory: Path) -> list[tuple[Path, str]]:
+    """扫描目录，返回 (问题文件路径, 原因) 列表。"""
+    problems = []
+    for fp in sorted(directory.rglob('*')):
+        if not fp.is_file():
+            continue
+        ext = fp.suffix.lower()
+        if ext == '.docx':
+            is_prob, reason = detect_docm(fp)
+        elif ext == '.pdf':
+            is_prob, reason = detect_broken_pdf(fp)
+        elif ext == '.txt':
+            is_prob, reason = detect_broken_txt(fp)
+        else:
+            continue
+        if is_prob:
+            problems.append((fp, reason))
+    return problems
 
 
 def _convert_with_docling(source_path: Path, output_path: Path
