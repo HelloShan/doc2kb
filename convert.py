@@ -65,6 +65,31 @@ def _get_docling_converter():
     return _DOCLING_CONVERTER
 
 
+def _is_docm_file(source_path: Path) -> bool:
+    """
+    检测伪装为 .docx 的宏文档 (.docm)。
+    从 ZIP 包中的 [Content_Types].xml 检查 ContentType 标记。
+    """
+    if source_path.suffix.lower() != '.docx':
+        return False
+    try:
+        import zipfile
+        from xml.etree import ElementTree as ET
+        with zipfile.ZipFile(str(source_path)) as z:
+            ct = z.read('[Content_Types].xml')
+            root = ET.fromstring(ct)
+            # 提取默认 namespace
+            ns = root.tag.split('}')[0].strip('{') if '}' in root.tag else ''
+            tag = f'{{{ns}}}Override' if ns else 'Override'
+            for override in root.iter(tag):
+                ct_type = override.get('ContentType', '')
+                if 'macroenabled' in ct_type.lower():
+                    return True
+        return False
+    except Exception:
+        return False
+
+
 def _convert_with_docling(source_path: Path, output_path: Path
                           ) -> Tuple[str, Optional[str], Optional[str]]:
     """
@@ -577,6 +602,12 @@ def convert_single_file(source_path: Path) -> dict:
         if ext not in SUPPORTED_EXTENSIONS:
             result["status"] = "skip"
             result["error"] = f"不支持格式 {ext}，忽略: {rel_path}"
+            return result
+
+        # 检测伪装为 .docx 的宏文档 → 跳过，需手工转换
+        if ext == ".docx" and _is_docm_file(source_path):
+            result["status"] = "skip"
+            result["error"] = f"宏文档 (.docm)，需用 Word 另存为 .docx: {rel_path}"
             return result
 
         output_path = _get_output_md_path(source_path)
