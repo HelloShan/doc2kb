@@ -68,12 +68,19 @@ def _get_docling_converter():
 def _convert_with_docling(source_path: Path, output_path: Path
                           ) -> Tuple[str, Optional[str], Optional[str]]:
     """
-    用 Docling 转换文档（支持 docx/pdf/xlsx/pptx）。
+    用 Docling 转换文档（支持 docx/pdf）。
     返回 (status, error, warning)。
+    静默 Docling 内部的图片/VML/格式不兼容等噪音。
     """
+    import contextlib
+
     try:
         conv = _get_docling_converter()
-        result = conv.convert(str(source_path))
+
+        # 静默 Docling 内部的 stderr 噪音（图片/VML/docm 错误等）
+        with contextlib.redirect_stderr(open(os.devnull, 'w')):
+            result = conv.convert(str(source_path))
+
         md_content = result.document.export_to_markdown()
 
         if not md_content.strip():
@@ -93,7 +100,7 @@ def _convert_with_docling(source_path: Path, output_path: Path
         return ("ok", None, warning)
 
     except ImportError:
-        return ("error", "缺少 docling 库，请执行: uv pip install docling", None)
+        return ("error", "缺少 docling 库", None)
     except Exception as e:
         return ("error", f"Docling {type(e).__name__}: {e}", None)
 

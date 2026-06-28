@@ -6,6 +6,8 @@ doc2kb — 中心化配置模块
 """
 
 import os
+import warnings
+import logging
 from datetime import datetime
 from pathlib import Path
 
@@ -13,17 +15,35 @@ from pathlib import Path
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 # ============================================================
+# 抑制第三方库的无效告警
+# ============================================================
+
+# Pillow：图片无法处理时不告警（直接丢弃）
+warnings.filterwarnings("ignore", category=UserWarning, module="PIL")
+warnings.filterwarnings("ignore", message=".*cannot write mode CMYK.*")
+warnings.filterwarnings("ignore", message=".*cannot identify image file.*")
+
+# Docling & python-docx：图片/VML/无LibreOffice 等噪音
+logging.getLogger("docling").setLevel(logging.ERROR)
+logging.getLogger("docling.datamodel").setLevel(logging.ERROR)
+logging.getLogger("docling.backend").setLevel(logging.ERROR)
+logging.getLogger("docling.pipeline").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", message=".*VML image cannot be found.*")
+warnings.filterwarnings("ignore", message=".*Found DrawingML elements.*")
+warnings.filterwarnings("ignore", message=".*LibreOffice.*")
+
+# ============================================================
 # 1. 目录路径
 # ============================================================
 
 # 原始文档目录 A：存放 docx/pdf/md 等源文件
-SOURCE_DIR = Path(os.getenv("DOC2KB_SOURCE_DIR", "./source_docs"))
+SOURCE_DIR = Path(os.getenv("DOC2KB_SOURCE_DIR", "../source_docs"))
 
 # MD 目标文件目录 B：转换后的 .md 文件存放位置
-OUTPUT_MD_DIR = Path(os.getenv("DOC2KB_OUTPUT_MD_DIR", "./output_md"))
+OUTPUT_MD_DIR = Path(os.getenv("DOC2KB_OUTPUT_MD_DIR", "../output_md"))
 
 # LanceDB 知识库路径 C：向量数据库存储位置
-DB_PATH = Path(os.getenv("DOC2KB_DB_PATH", "./doc2kb.lancedb"))
+DB_PATH = Path(os.getenv("DOC2KB_DB_PATH", "../doc2kb.lancedb"))
 
 # 流水线状态文件
 STATE_FILE = Path(os.getenv("DOC2KB_STATE_FILE", "./pipeline_state.json"))
