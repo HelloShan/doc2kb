@@ -146,11 +146,12 @@ def chunk_markdown_file(md_path: Path) -> List[dict]:
 # ============================================================
 
 def _delete_old_chunks(table, source_rel_path: str):
-    """从 LanceDB 中删除指定源文件的所有旧分块。"""
-    try:
-        table.delete(f'source = "{source_rel_path}"')
-    except Exception:
-        pass  # 表可能是空的，忽略
+    """从 LanceDB 中删除指定源文件的所有旧分块（线程安全）。"""
+    with _lancedb_lock:
+        try:
+            table.delete(f'source = "{source_rel_path}"')
+        except Exception:
+            pass  # 表可能是空的，忽略
 
 
 def ingest_single_md(md_path: Path, source_rel_path: str,
@@ -258,7 +259,8 @@ def ingest_single_md(md_path: Path, source_rel_path: str,
             "chunk_index": indices_pa,
             "chunk_total": totals_pa,
         }, schema=schema)
-        table.add(pa_table)
+        with _lancedb_lock:
+            table.add(pa_table)
 
         result["status"] = "ok"
         result["chunks"] = len(chunks)

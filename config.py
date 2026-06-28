@@ -91,7 +91,7 @@ SIMILARITY_THRESHOLD = 0.5
 # ============================================================
 
 # 转换阶段的并行线程数
-CONVERT_WORKERS = 8
+CONVERT_WORKERS = 4
 
 # 入库阶段的 batch 大小（每批处理的文本数）
 EMBED_BATCH_SIZE = 32

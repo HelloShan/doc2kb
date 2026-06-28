@@ -190,8 +190,12 @@ def _convert_with_docling(source_path: Path, output_path: Path
         conv = _get_docling_converter()
 
         # 静默 Docling 内部的 stderr 噪音（图片/VML/docm 错误等）
-        with contextlib.redirect_stderr(open(os.devnull, 'w')):
-            result = conv.convert(str(source_path))
+        devnull = open(os.devnull, 'w')
+        try:
+            with contextlib.redirect_stderr(devnull):
+                result = conv.convert(str(source_path))
+        finally:
+            devnull.close()
 
         md_content = result.document.export_to_markdown()
 
@@ -246,7 +250,7 @@ _BOILERPLATE_LINE_PATTERNS = [
     re.compile(r'^(作者|编写[：:]?|编制[：:]?|审核[：:]?|批准[：:]?|校对[：:]?|会审[：:]?|评审[：:]?|起草[：:]?|复核[：:]?)'),
     re.compile(r'^(第\s*\d+\s*页|Page\s+\d+|—\s*\d+\s*—|-\s*\d+\s*-)$'),
     re.compile(r'^中兴通讯|^ZTE\s*CORPORATION|^ZTE\s*中兴'),
-    re.compile(r'(技术文件|技术手册|产品文档|产品手册|用户手册|操作指南)'),
+    re.compile(r'^(技术文件|技术手册|产品文档|产品手册|用户手册|操作指南)'),
     re.compile(r'^文档版本\s*\d'),
     re.compile(r'^[\u2460-\u2473①-⑳]'),  # 带圈数字（常用于版权脚注）
 ]
@@ -289,7 +293,7 @@ _COVER_LINE = re.compile(r'^[\u4e00-\u9fff\w\s]{1,30}$')
 _COVER_END_MARKER = re.compile(r'^#{1,6}\s|^第[一二三四五六七八九十\d]+[章节篇]')
 
 
-def _is_junk_row(cells: list[str]) -> bool:
+def _is_junk_table_row(cells: list[str]) -> bool:
     """判断表格行是否全是空单元格或纯零值（垃圾行）。"""
     for c in cells:
         s = c.strip()
@@ -319,7 +323,7 @@ def _compact_table_block(lines: list[str]) -> list[str]:
             cells = line.split('|')
             if len(cells) >= 3:
                 content = [c.strip() for c in cells[1:-1]]
-                if not _is_junk_row(content):
+                if not _is_junk_table_row(content):
                     all_junk = False
                     break
         if all_junk:
@@ -341,7 +345,7 @@ def _compact_table_block(lines: list[str]) -> list[str]:
             # 去掉前导空单元格
             while cc and not cc[0]:
                 cc.pop(0)
-            if _is_junk_row(cc):
+            if _is_junk_table_row(cc):
                 continue
             out.append('| ' + ' | '.join(cc) + ' |')
         return out
@@ -385,11 +389,11 @@ def _compact_table_block(lines: list[str]) -> list[str]:
     out = []
     for idx, content_cells, _, is_sep in processed:
         if is_sep:
-            sep_part = content_cells[:real_cols]
+            sep_part = ['---'] * real_cols  # 强制补齐到实际列数
             out.append('|' + '|'.join(sep_part) + '|')
             continue
 
-        if _is_junk_row(content_cells):
+        if _is_junk_table_row(content_cells):
             continue
 
         cells = content_cells[:real_cols]
@@ -498,6 +502,8 @@ def _clean_md_content(content: str) -> str:
     cleaned = re.sub(r'^\|(?:\s*\|\s*)*\s*(?=\S)', '| ', cleaned, flags=re.M)
     #  5) 清理残留的孤立空单元格（行中连续多个空格|）  
     cleaned = re.sub(r'\|\s*\|\s*(?=\|)', '| ', cleaned)
+    #  6) 移除 Docling 残留的 HTML 注释（如 <!-- image -->、<!-- 表1-1 指标集示例 --> 等）
+    cleaned = re.sub(r'<!--.*?-->', '', cleaned, flags=re.DOTALL)
 
     cleaned = re.sub(r'\n{4,}', '\n\n\n', cleaned)
     return cleaned.strip()
@@ -668,7 +674,7 @@ def _xlsx_fallback(source_path: Path, output_path: Path
             headers = [str(c) if c is not None else "" for c in rows[0]]
             md_lines.append("| " + " | ".join(headers) + " |")
             md_lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
-            data_rows = [row for row in rows[1:] if not _is_junk_row(row)]
+            data_rows = [row for row in rows[1:] if not _is_junk_xlsx_row(row)]
             for row in data_rows:
                 cells = [str(c) if c is not None else "" for c in row]
                 md_lines.append("| " + " | ".join(cells) + " |")
@@ -733,7 +739,7 @@ def _is_junk_cell(value) -> bool:
     return s == "" or s == "0" or s == "0.0"
 
 
-def _is_junk_row(row: tuple) -> bool:
+def _is_junk_xlsx_row(row: tuple) -> bool:
     if not row:
         return True
     return all(_is_junk_cell(cell) for cell in row)

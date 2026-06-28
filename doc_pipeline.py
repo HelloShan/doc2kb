@@ -302,6 +302,9 @@ def run_build(args, log: Logger):
             log.info(f"  待入库（全量）: {len(files_to_ingest)} 个 MD 文件")
         # 增量入库在转换完成后自动添加
 
+    # ── 扫描完成，立即持久化初始状态（防止中途杀进程丢进度）──
+    state.save()
+
     # ── Stage 1: 文档转换 ──
     if files_to_convert and not ingest_only:
         stage_label = "1/2 (仅转换)" if convert_only else "1/2"
@@ -389,11 +392,14 @@ def _on_convert_done(result: dict, state: PipelineState,
                             md_path=result.get("md_path"),
                             error=error)
     stats.convert_done(result)
+    state.save()  # 实时写盘，防止杀进程丢进度
 
     if status == "ok":
         warning = result.get("warning")
         if warning:
             log.warn(f"  ⚠ {rel}: {warning}")
+        else:
+            log.ok(f"  {rel}")
     elif status == "skip":
         log.warn(f"  跳过 {rel}: {error}")
     elif status == "garbled":
@@ -415,9 +421,10 @@ def _on_ingest_done(result: dict, state: PipelineState,
                            chunks=result.get("chunks", 0),
                            error=error)
     stats.ingest_done(result)
+    state.save()  # 实时写盘，防止杀进程丢进度
 
     if status == "ok":
-        pass  # 静默成功
+        log.ok(f"  {rel} ({result.get('chunks', 0)} chunks)")
     else:
         log.err(f"  入库失败 {rel}: {error}")
 
