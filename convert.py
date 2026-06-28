@@ -289,13 +289,89 @@ _COVER_LINE = re.compile(r'^[\u4e00-\u9fff\w\s]{1,30}$')
 _COVER_END_MARKER = re.compile(r'^#{1,6}\s|^第[一二三四五六七八九十\d]+[章节篇]')
 
 
+def _is_junk_row(cells: list[str]) -> bool:
+    """判断表格行是否全是空单元格或纯零值（垃圾行）。"""
+    for c in cells:
+        s = c.strip()
+        if s and s != '0':
+            return False
+    return True
+
+
+def _compact_table_block(lines: list[str]) -> list[str]:
+    """压缩表格块：去掉尾部空单元格、移除纯空/纯零行、自动计算实际列数。"""
+    # 找出分隔线行
+    sep_idx = -1
+    for i, line in enumerate(lines):
+        if '---' in line:
+            sep_idx = i
+            break
+    if sep_idx < 0:
+        return lines  # 没有分隔线，不是标准表格，跳过
+
+    # 处理每行：先去尾部空单元格，记录实际使用列数
+    processed = []
+    for i, line in enumerate(lines):
+        cells = line.split('|')
+        if len(cells) < 3:
+            processed.append((i, cells, 0))
+            continue
+
+        content_cells = cells[1:-1]  # 去掉首尾空白
+
+        # 分隔线行：只记有 --- 的单元格数
+        if i == sep_idx:
+            col_count = sum(1 for c in content_cells if '---' in c)
+            processed.append((i, ['---'] * col_count, col_count))
+            continue
+
+        # 数据行：去掉尾部空单元格
+        while content_cells and not content_cells[-1].strip():
+            content_cells.pop()
+        # 去掉尾部纯零单元格
+        while content_cells and all(c.strip() == '0' for c in content_cells[-1:]):
+            content_cells.pop()
+
+        processed.append((i, content_cells, len(content_cells)))
+
+    # 确定表格实际列数 = 所有数据行的最大列数（分隔线行除外）
+    real_cols = max(
+        (cnt for idx, _, cnt in processed if idx != sep_idx and cnt > 0),
+        default=0
+    )
+    if real_cols <= 1:
+        return lines  # 单列或空表，不处理
+
+    out = []
+    sep_seen = False
+    for idx, content_cells, _ in processed:
+        if idx == sep_idx:
+            # 分隔线：截断到 real_cols
+            sep_part = content_cells[:real_cols]
+            out.append('|' + '|'.join(sep_part) + '|')
+            sep_seen = True
+            continue
+
+        if _is_junk_row(content_cells):
+            continue  # 跳过纯空/纯零行
+
+        # 截断到 real_cols
+        cells = content_cells[:real_cols]
+        reconstructed = '| ' + ' | '.join(c.strip() for c in cells) + ' |'
+        out.append(reconstructed)
+
+    return out
+
+
 def _clean_md_content(content: str) -> str:
     """
-    移除 Markdown 中的封面/目录/版权/版本记录/作者信息等模板化段落。
+    移除 Markdown 中的封面/目录/版权/版本记录/作者信息等模板化段落，
+    以及表格中的空单元格/零值占位等冗余内容。
     策略：
       1. 先检测 TOC 段落（基于段落特征），标注范围
       2. 再移除匹配的单行模板模式
       3. 检测并移除文件开头的封面段
+      4. 压缩表格：去掉尾部空单元格、移除纯空/纯零行
     """
     if not content.strip():
         return content
@@ -339,7 +415,30 @@ def _clean_md_content(content: str) -> str:
             for j in range(first_heading_idx):
                 keep[j] = False
 
-    cleaned = '\n'.join(line for i, line in enumerate(lines) if keep[i])
+    # Pass 4: 表格压缩（对每个表格块单独处理）
+    result_lines = []
+    i = 0
+    while i < n:
+        if not keep[i]:
+            result_lines.append(lines[i])
+            i += 1
+            continue
+
+        # 检测表格块：连续以 | 开头的行
+        if lines[i].strip().startswith('|'):
+            block = []
+            while i < n and keep[i] and lines[i].strip().startswith('|'):
+                block.append(lines[i])
+                i += 1
+            if block:
+                compressed = _compact_table_block(block)
+                result_lines.extend(compressed)
+            continue
+
+        result_lines.append(lines[i])
+        i += 1
+
+    cleaned = '\n'.join(result_lines)
     cleaned = re.sub(r'\n{4,}', '\n\n\n', cleaned)
     return cleaned.strip()
 
