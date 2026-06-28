@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config import (
     SOURCE_DIR, OUTPUT_MD_DIR, SUPPORTED_EXTENSIONS,
-    CONVERT_WORKERS, MAX_MD_FILE_SIZE_MB,
+    CONVERT_WORKERS, MAX_MD_FILE_SIZE_KB,
 )
 from validate import is_file_readable
 from state import compute_sha256
@@ -232,9 +232,9 @@ def _convert_with_docling(source_path: Path, output_path: Path
 def _check_md_size(md_path: Path) -> Optional[str]:
     """MD 文件超过阈值时返回预警信息。"""
     if md_path.exists():
-        size_mb = md_path.stat().st_size / (1024 * 1024)
-        if size_mb > MAX_MD_FILE_SIZE_MB:
-            return f"MD 文件过大 ({size_mb:.1f}MB)，可能影响入库性能"
+        size_kb = md_path.stat().st_size / 1024
+        if size_kb > MAX_MD_FILE_SIZE_KB:
+            return f"MD 文件过大 ({size_kb:.0f}KB)，可能影响入库性能"
     return None
 
 

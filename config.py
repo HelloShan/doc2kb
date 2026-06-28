@@ -63,8 +63,8 @@ SUPPORTED_EXTENSIONS = {".docx", ".md", ".pdf", ".txt", ".pptx", ".xlsx"}
 # Docling 提供表格还原、多栏识别、页眉页脚剥离等高级能力
 CONVERT_ENGINE = os.getenv("DOC2KB_CONVERT_ENGINE", "docling")
 
-# 生成 MD 文件超过此大小（MB）时打印警告
-MAX_MD_FILE_SIZE_MB = 20
+# 生成 MD 文件超过此大小（KB）时打印警告
+MAX_MD_FILE_SIZE_KB = 500
 
 # ============================================================
 # 3. RAG / 分块配置
