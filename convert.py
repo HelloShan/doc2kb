@@ -338,6 +338,9 @@ def _compact_table_block(lines: list[str]) -> list[str]:
             # 去掉尾部纯零单元格
             while cc and all(c == '0' for c in cc[-1:]):
                 cc.pop()
+            # 去掉前导空单元格
+            while cc and not cc[0]:
+                cc.pop(0)
             if _is_junk_row(cc):
                 continue
             out.append('| ' + ' | '.join(cc) + ' |')
