@@ -2,8 +2,6 @@
 """
 doc2kb — 统一文档流水线 CLI
 ==============================
-合并 convert_doc2md + vmax-knowledge-db 的统一工程。
-
 将原始文档（docx/pdf/md/txt/pptx）→ Markdown → LanceDB 向量知识库，
 使用 SHA256 追踪文件变更，支持增量/全量/重试等多种模式。
 

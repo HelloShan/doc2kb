@@ -4,8 +4,6 @@
 
 将原始文档自动转换为 Markdown（含模板段落清洁），再构建成 LanceDB 向量知识库（RAG 可检索）。
 
-合并了 `convert_doc2md`（文档转换）与 `vmax-knowledge-db`（知识库构建）两个工程，**统一状态管理、增量更新、失败重试**。
-
 ---
 
 ## 🚀 快速开始
@@ -25,7 +23,7 @@ uv pip install docling
 doc2kb/
 ├── source_docs/          ← 把你的文档放这里 (docx/pdf/md/txt/pptx/xlsx)
 ├── output_md/            ← 自动生成的 MD 文件
-├── my_vmax_knowledge.lancedb/  ← 输出的向量知识库
+├── doc2kb.lancedb/  ← 输出的向量知识库
 └── pipeline_20260628.log ← 自动生成的日期日志
 ```
 
@@ -72,7 +70,7 @@ source_docs/ (docx/pdf/md/txt/pptx/xlsx)
 └─────────────────────────────────────┘
      │                       │
      ▼                       ▼
-  output_md/          my_vmax_knowledge.lancedb/
+  output_md/          doc2kb.lancedb/
   (清洁后的 MD)       (向量知识库)
 ```
 
@@ -144,7 +142,7 @@ PDF→MD 转换后自动检测，通过中文标点计数 + 模板匹配 + ASCII
 |------|--------|------|
 | `SOURCE_DIR` | `./source_docs` | 源文档目录 |
 | `OUTPUT_MD_DIR` | `./output_md` | MD 输出目录 |
-| `DB_PATH` | `./my_vmax_knowledge.lancedb` | LanceDB 路径 |
+| `DB_PATH` | `./doc2kb.lancedb` | LanceDB 路径 |
 | `LOG_FILE` | `pipeline_YYYYMMDD.log` | 日志文件（按日期） |
 | `CONVERT_WORKERS` | 2 | 并行线程数 |
 | `CHUNK_SIZE` | 1200 | 分块字符数 |
@@ -152,7 +150,7 @@ PDF→MD 转换后自动检测，通过中文标点计数 + 模板匹配 + ASCII
 | `EMBEDDING_MODEL` | `bge-small-zh-v1.5` | 嵌入模型 |
 | `LARGE_FILE_THRESHOLD_MB` | 50 | 跳过超大文件 |
 
-所有配置项可通过 `VMAX_` 前缀环境变量覆盖。
+所有配置项可通过 `DOC2KB_` 前缀环境变量覆盖。
 
 ---
 

@@ -2,7 +2,7 @@
 doc2kb — 中心化配置模块
 ==========================
 所有可调参数集中在此文件，方便管理和覆盖。
-支持通过环境变量覆盖（如 VMAX_SOURCE_DIR, VMAX_OUTPUT_MD_DIR 等）。
+支持通过环境变量覆盖（如 DOC2KB_SOURCE_DIR, DOC2KB_OUTPUT_MD_DIR 等）。
 """
 
 import os
@@ -17,20 +17,20 @@ os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 # ============================================================
 
 # 原始文档目录 A：存放 docx/pdf/md 等源文件
-SOURCE_DIR = Path(os.getenv("VMAX_SOURCE_DIR", "./source_docs"))
+SOURCE_DIR = Path(os.getenv("DOC2KB_SOURCE_DIR", "./source_docs"))
 
 # MD 目标文件目录 B：转换后的 .md 文件存放位置
-OUTPUT_MD_DIR = Path(os.getenv("VMAX_OUTPUT_MD_DIR", "./output_md"))
+OUTPUT_MD_DIR = Path(os.getenv("DOC2KB_OUTPUT_MD_DIR", "./output_md"))
 
 # LanceDB 知识库路径 C：向量数据库存储位置
-DB_PATH = Path(os.getenv("VMAX_DB_PATH", "./my_vmax_knowledge.lancedb"))
+DB_PATH = Path(os.getenv("DOC2KB_DB_PATH", "./doc2kb.lancedb"))
 
 # 流水线状态文件
-STATE_FILE = Path(os.getenv("VMAX_STATE_FILE", "./pipeline_state.json"))
+STATE_FILE = Path(os.getenv("DOC2KB_STATE_FILE", "./pipeline_state.json"))
 
 # 日志文件（默认按日期自动生成，如 pipeline_20260628.log）
 _DEFAULT_LOG = f"pipeline_{datetime.now().strftime('%Y%m%d')}.log"
-LOG_FILE = os.getenv("VMAX_LOG_FILE", _DEFAULT_LOG)
+LOG_FILE = os.getenv("DOC2KB_LOG_FILE", _DEFAULT_LOG)
 
 # ============================================================
 # 2. 文档转换配置
@@ -41,7 +41,7 @@ SUPPORTED_EXTENSIONS = {".docx", ".md", ".pdf", ".txt", ".pptx", ".xlsx"}
 
 # PDF 转换引擎：可选 "docling"（高质量）或 "pypdf"（轻量、纯Python）
 # docling 支持复杂布局，但依赖较重；pypdf 轻量但只提取纯文本
-PDF_ENGINE = os.getenv("VMAX_PDF_ENGINE", "pypdf")
+PDF_ENGINE = os.getenv("DOC2KB_PDF_ENGINE", "pypdf")
 
 # 当 PDF 用 pypdf 提取的文字少于此阈值字符数时，尝试 OCR 回退
 PDF_MIN_TEXT_CHARS = 50
