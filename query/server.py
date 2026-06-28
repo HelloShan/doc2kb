@@ -9,13 +9,13 @@ doc2kb 通用 LanceDB 检索服务器
 
 用法:
   # 启动常驻服务器
-  python retrieval/server.py --server
+  python query/server.py --server
 
   # CLI 单题查询（自动拉起 server）
-  python retrieval/server.py --question "你的问题"
+  python query/server.py --question "你的问题"
 
   # CLI 批量查询
-  python retrieval/server.py --batch '[{"id":"1","question":"问题A"}]'
+  python query/server.py --batch '[{"id":"1","question":"问题A"}]'
 
   # HTTP API
   curl http://127.0.0.1:8788/health
