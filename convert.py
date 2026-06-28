@@ -300,62 +300,78 @@ def _is_junk_row(cells: list[str]) -> bool:
 
 def _compact_table_block(lines: list[str]) -> list[str]:
     """压缩表格块：去掉尾部空单元格、移除纯空/纯零行、自动计算实际列数。"""
-    # 找出分隔线行
-    sep_idx = -1
+    # 找出所有分隔线行（只检测实际表格中的分隔线 = 整行仅含 --- 和 |）
+    # 并记录分隔线的列数
+    sep_indices = set()
+    sep_col_count = 0
     for i, line in enumerate(lines):
-        if '---' in line:
-            sep_idx = i
-            break
-    if sep_idx < 0:
-        return lines  # 没有分隔线，不是标准表格，跳过
+        cells = line.split('|')
+        has_sep = sum(1 for c in cells if c.strip().replace('-', '').strip() == '' and '---' in c)
+        if has_sep >= 2:
+            sep_indices.add(i)
+            if has_sep > sep_col_count:
+                sep_col_count = has_sep
+
+    if not sep_indices:
+        # 没有分隔线：检查是否全是纯空/纯零行 → 移除
+        all_junk = True
+        for line in lines:
+            cells = line.split('|')
+            if len(cells) >= 3:
+                content = [c.strip() for c in cells[1:-1]]
+                if not _is_junk_row(content):
+                    all_junk = False
+                    break
+        if all_junk:
+            return []
+        return lines  # 不是标准表格，跳过
+
+    if sep_col_count <= 1:
+        return lines  # 单列分隔线，不处理
 
     # 处理每行：先去尾部空单元格，记录实际使用列数
     processed = []
     for i, line in enumerate(lines):
         cells = line.split('|')
         if len(cells) < 3:
-            processed.append((i, cells, 0))
+            processed.append((i, cells, 0, False))
             continue
 
-        content_cells = cells[1:-1]  # 去掉首尾空白
+        content_cells = cells[1:-1]
 
-        # 分隔线行：只记有 --- 的单元格数
-        if i == sep_idx:
+        if i in sep_indices:
             col_count = sum(1 for c in content_cells if '---' in c)
-            processed.append((i, ['---'] * col_count, col_count))
+            processed.append((i, ['---'] * col_count, col_count, True))
             continue
 
         # 数据行：去掉尾部空单元格
         while content_cells and not content_cells[-1].strip():
             content_cells.pop()
-        # 去掉尾部纯零单元格
         while content_cells and all(c.strip() == '0' for c in content_cells[-1:]):
             content_cells.pop()
 
-        processed.append((i, content_cells, len(content_cells)))
+        processed.append((i, content_cells, len(content_cells), False))
 
     # 确定表格实际列数 = 所有数据行的最大列数（分隔线行除外）
     real_cols = max(
-        (cnt for idx, _, cnt in processed if idx != sep_idx and cnt > 0),
+        (cnt for _, _, cnt, is_sep in processed if not is_sep and cnt > 0),
         default=0
     )
-    if real_cols <= 1:
-        return lines  # 单列或空表，不处理
+    if real_cols == 0:
+        return []  # 纯空表（只有分隔线和空行），全部移除
+    if real_cols == 1:
+        return lines  # 单列表格，不处理
 
     out = []
-    sep_seen = False
-    for idx, content_cells, _ in processed:
-        if idx == sep_idx:
-            # 分隔线：截断到 real_cols
+    for idx, content_cells, _, is_sep in processed:
+        if is_sep:
             sep_part = content_cells[:real_cols]
             out.append('|' + '|'.join(sep_part) + '|')
-            sep_seen = True
             continue
 
         if _is_junk_row(content_cells):
-            continue  # 跳过纯空/纯零行
+            continue
 
-        # 截断到 real_cols
         cells = content_cells[:real_cols]
         reconstructed = '| ' + ' | '.join(c.strip() for c in cells) + ' |'
         out.append(reconstructed)
@@ -424,11 +440,20 @@ def _clean_md_content(content: str) -> str:
             i += 1
             continue
 
-        # 检测表格块：连续以 | 开头的行
-        if lines[i].strip().startswith('|'):
+        # 检测表格块：只要包含 | 且在分隔线行或空/零值行范围内的连续行
+        raw = lines[i].strip()
+        if '|' in raw:
             block = []
-            while i < n and keep[i] and lines[i].strip().startswith('|'):
-                block.append(lines[i])
+            while i < n and keep[i]:
+                cur = lines[i].strip()
+                if '|' not in cur:
+                    break
+                # 规范化：确保有前导 | 和尾随 | 方便处理
+                if not cur.startswith('|'):
+                    cur = '|' + cur
+                if not cur.endswith('|'):
+                    cur = cur + '|'
+                block.append(cur)
                 i += 1
             if block:
                 compressed = _compact_table_block(block)
