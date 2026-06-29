@@ -258,7 +258,7 @@ def run_build(args, log: Logger):
 
         if is_full:
             # 全量模式：所有文件都需要处理
-            state.init_file(rel, sha256, stat.st_size, mtime)
+            state.init_file(rel, sha256, stat.st_size, mtime, str(fp))
             if not convert_only and not ingest_only:
                 files_to_convert.append(fp)
                 stats.add_convert_file_info("new")
@@ -269,7 +269,7 @@ def run_build(args, log: Logger):
             # 增量模式：只处理变更或失败的文件
             entry = state.get_file_state(rel)
             if state.needs_rebuild(rel, sha256):
-                state.init_file(rel, sha256, stat.st_size, mtime)
+                state.init_file(rel, sha256, stat.st_size, mtime, str(fp))
 
                 # 关键优化：如果转换已完成但入库未完成，直接进 ingest 队列，不重复转换
                 if state.is_convert_done(rel):
@@ -291,7 +291,7 @@ def run_build(args, log: Logger):
                         stats.add_convert_file_info("retry")
             else:
                 # 文件未变更且转换已成功，跳过
-                state.init_file(rel, sha256, stat.st_size, mtime)
+                state.init_file(rel, sha256, stat.st_size, mtime, str(fp))
                 stats.add_convert_file_info("skip")
 
     # 入库文件列表：
@@ -370,7 +370,7 @@ def run_build(args, log: Logger):
         if not convert_only:
             for r in conv_results:
                 if r["status"] == "ok" and r["md_path"]:
-                    md_abs = OUTPUT_MD_DIR / r["md_path"]
+                    md_abs = Path(r["md_path"])  # md_path 已是绝对路径
                     files_to_ingest.append((md_abs, r["rel_path"], r["sha256"]))
 
     # ── Stage 2: 向量入库 ──

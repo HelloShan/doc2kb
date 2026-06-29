@@ -201,7 +201,8 @@ class PipelineState:
 
     # ---- 更新 ----
 
-    def init_file(self, rel_path: str, sha256: str, size: int, mtime: str):
+    def init_file(self, rel_path: str, sha256: str, size: int, mtime: str,
+                  abs_source_path: str = ""):
         """初始化文件记录（如果不存在或 SHA256 已变）。"""
         entry = self._data["files"].get(rel_path)
         if entry and entry.get("sha256") == sha256:
@@ -210,6 +211,7 @@ class PipelineState:
             "sha256": sha256,
             "size": size,
             "mtime": mtime,
+            "abs_source_path": abs_source_path,
             "conversion": make_conversion_record(ST_PENDING),
             "ingestion": make_ingestion_record(ST_PENDING),
         }

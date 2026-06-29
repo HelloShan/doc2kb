@@ -911,7 +911,7 @@ def convert_single_file(source_path: Path) -> dict:
             result["warning"] = warning
 
         if result["status"] == "ok":
-            result["md_path"] = output_path.relative_to(OUTPUT_MD_DIR).with_suffix(".md").as_posix()
+            result["md_path"] = str(output_path.with_suffix(".md").absolute())
 
     except Exception as e:
         result["status"] = "error"
