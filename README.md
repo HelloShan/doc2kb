@@ -21,10 +21,10 @@ uv pip install docling
 ### 2. 准备文档目录
 
 ```
-├── source_docs/          ← 把你的文档放这里 (docx/pdf/md/txt/pptx/xlsx)
-├── output_md/            ← 自动生成的 MD 文件
-├── doc2kb.lancedb/  ← 输出的向量知识库
-doc2kb/
+source_docs/          ← 把你的文档放这里 (docx/pdf/md/txt/pptx/xlsx)
+output_md/            ← 自动生成的 MD 文件
+doc2kb.lancedb/       ← 输出的向量知识库
+doc2kb/               ← 代码目录
 └── pipeline_20260628.log ← 自动生成的日期日志
 ```
 
