@@ -111,13 +111,19 @@ def search(question: str, top_k: int = TOP_K, threshold: float = SIMILARITY_THRE
         return {"found": False, "query": question, "results": [], "hits": 0, "error": f"向量化失败: {e}"}
 
     try:
-        raw = table.search(query_vec.tolist()).metric("cosine").limit(max(top_k * 2, top_k)).to_list()
+        raw = (table
+               .search(query_vec.tolist(), query_type="hybrid")
+               .add_fts_query(question)
+               .rerank(reranker="rrf")
+               .metric("cosine")
+               .limit(max(top_k * 2, top_k))
+               .to_list())
     except Exception as e:
         return {"found": False, "query": question, "results": [], "hits": 0, "error": f"检索失败: {e}"}
 
     filtered = []
     for r in raw:
-        sim = 1 - r.get("_distance", 0) / 2
+        sim = 1 / (1 + r.get("_distance", 0))  # 归一化：0→1.0, 2→0.33
         if sim >= threshold:
             filtered.append({
                 "text": r.get("text", "").strip(),

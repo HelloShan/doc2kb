@@ -79,6 +79,7 @@ def _open_or_create_db():
                 _table = _db.open_table(TABLE_NAME)
             except Exception:
                 _table = _db.create_table(TABLE_NAME, schema=schema)
+                _table.create_fts_index("text", replace=True)
 
         return _table
 
