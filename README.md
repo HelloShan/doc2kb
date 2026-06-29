@@ -2,8 +2,8 @@
 
 **文档→向量知识库统一流水线**
 
-将原始文档自动转换为 Markdown（含模板段落清洁），再构建成 LanceDB 向量知识库（RAG 可检索）。
-只处理文字，不做图片识别；代码由deepseek v4完成。
+将原始文档自动转换为 Markdown（只处理文字，不做图片识别），再构建成 LanceDB 向量知识库（RAG 可检索）。
+代码由deepseek v4完成。
 
 ---
 
@@ -14,17 +14,17 @@
 ```bash
 uv pip install -r requirements.txt
 
-# 如需 PDF 高质量转换（含布局分析）
+# 默认 PDF 高质量转换（含布局分析）
 uv pip install docling
 ```
 
 ### 2. 准备文档目录
 
 ```
-doc2kb/
 ├── source_docs/          ← 把你的文档放这里 (docx/pdf/md/txt/pptx/xlsx)
 ├── output_md/            ← 自动生成的 MD 文件
 ├── doc2kb.lancedb/  ← 输出的向量知识库
+doc2kb/
 └── pipeline_20260628.log ← 自动生成的日期日志
 ```
 
@@ -126,9 +126,9 @@ PDF→MD 转换后自动检测，通过中文标点计数 + 模板匹配 + ASCII
 
 | 配置 | 默认值 | 说明 |
 |------|--------|------|
-| `SOURCE_DIR` | `./source_docs` | 源文档目录 |
-| `OUTPUT_MD_DIR` | `./output_md` | MD 输出目录 |
-| `DB_PATH` | `./doc2kb.lancedb` | LanceDB 路径 |
+| `SOURCE_DIR` | `../source_docs` | 源文档目录 |
+| `OUTPUT_MD_DIR` | `../output_md` | MD 输出目录 |
+| `DB_PATH` | `../doc2kb.lancedb` | LanceDB 路径 |
 | `LOG_FILE` | `pipeline_YYYYMMDD.log` | 日志文件（按日期） |
 | `CONVERT_WORKERS` | 4 | 并行线程数 |
 | `CHUNK_SIZE` | 1200 | 分块字符数 |
@@ -143,7 +143,7 @@ PDF→MD 转换后自动检测，通过中文标点计数 + 模板匹配 + ASCII
 ## 🪟 兼容性 & 最低配置
 
 - **操作系统**: Windows 11 / Linux / macOS
-- **CPU**: 2 线程
+- **CPU**: 4 线程
 - **内存**: 2GB
 - **依赖**: 纯 Python 包，无需系统级工具
 
