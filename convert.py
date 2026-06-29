@@ -31,6 +31,9 @@ from validate import is_file_readable
 from state import compute_sha256
 from docx.opc.exceptions import PackageNotFoundError
 
+# 模块级 /dev/null 句柄（多线程复用，避免并发 close 炸 sys.stderr）
+_DEVNULL = open(os.devnull, "w")
+
 
 # ============================================================
 # 工具函数
@@ -128,13 +131,9 @@ def detect_broken_pdf(file_path: Path) -> tuple[bool, str]:
         old_level = logger.level
         logger.setLevel(logging.ERROR)
         try:
-            devnull = open(os.devnull, 'w')
-            try:
-                with contextlib.redirect_stderr(devnull):
-                    reader = PdfReader(str(file_path))
-                    _ = len(reader.pages)
-            finally:
-                devnull.close()
+            with contextlib.redirect_stderr(_DEVNULL):
+                reader = PdfReader(str(file_path))
+                _ = len(reader.pages)
             return False, ''
         except pypdf_errors.PdfStreamError:
             return True, 'PDF 流意外结束（文件损坏或不完整）'
@@ -194,12 +193,8 @@ def _convert_with_docling(source_path: Path, output_path: Path
         conv = _get_docling_converter()
 
         # 静默 Docling 内部的 stderr 噪音（图片/VML/docm 错误等）
-        devnull = open(os.devnull, 'w')
-        try:
-            with contextlib.redirect_stderr(devnull):
-                result = conv.convert(str(source_path))
-        finally:
-            devnull.close()
+        with contextlib.redirect_stderr(_DEVNULL):
+            result = conv.convert(str(source_path))
 
         md_content = result.document.export_to_markdown()
 
