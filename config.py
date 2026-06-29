@@ -46,7 +46,7 @@ OUTPUT_MD_DIR = Path(os.getenv("DOC2KB_OUTPUT_MD_DIR", "../output_md"))
 DB_PATH = Path(os.getenv("DOC2KB_DB_PATH", "../doc2kb.lancedb"))
 
 # 流水线状态文件
-STATE_FILE = Path(os.getenv("DOC2KB_STATE_FILE", "./pipeline_state.json"))
+STATE_FILE = Path(os.getenv("DOC2KB_STATE_FILE", "../pipeline_state.json"))
 
 # 日志文件（默认按日期自动生成，如 pipeline_20260628.log）
 _DEFAULT_LOG = f"pipeline_{datetime.now().strftime('%Y%m%d')}.log"
