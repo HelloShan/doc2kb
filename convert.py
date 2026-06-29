@@ -18,6 +18,7 @@ doc2kb — 文档转换引擎模块
 
 import os
 import re
+import sys
 import traceback
 from pathlib import Path
 from typing import Optional, Tuple, List
@@ -180,20 +181,8 @@ def scan_compatibility(directory: Path) -> list[tuple[Path, str]]:
     return problems
 
 
-def _docling_worker(source_path: str, output_path: str, result_file: str):
-    """子进程：单独运行 docling 转换，结果写回 result_file"""
-    try:
-        from docling.document_converter import DocumentConverter
-        conv = DocumentConverter()
-        result = conv.convert(source_path)
-        md_content = result.document.export_to_markdown()
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(md_content)
-        with open(result_file, 'w') as f:
-            import json; json.dump({"status": "ok"}, f)
-    except Exception as e:
-        with open(result_file, 'w') as f:
-            import json; json.dump({"status": "error", "error": f"{type(e).__name__}: {e}"}, f)
+# Docling 子进程 Worker 路径
+_WORKER_PATH = Path(__file__).parent / "docling_worker.py"
 
 
 def _convert_with_docling(source_path: Path, output_path: Path
@@ -204,7 +193,7 @@ def _convert_with_docling(source_path: Path, output_path: Path
     子进程模式确保主进程不会因此崩溃。
     返回 (status, error, warning)。
     """
-    import multiprocessing as mp
+    import subprocess
     import tempfile
     import json
 
@@ -212,23 +201,18 @@ def _convert_with_docling(source_path: Path, output_path: Path
     rf.close()
     result_file = rf.name
 
-    p = mp.Process(
-        target=_docling_worker,
-        args=(str(source_path), str(output_path), result_file),
-    )
-    p.start()
-    p.join(timeout=CONVERT_TIMEOUT)
-
     try:
-        if p.is_alive():
-            p.kill()
-            p.join()
-            return ("error", "Docling 子进程超时（>600s），已强制终止", None)
+        result = subprocess.run(
+            [sys.executable, str(_WORKER_PATH),
+             str(source_path), str(output_path), result_file],
+            capture_output=True,
+            timeout=CONVERT_TIMEOUT,
+        )
 
-        if p.exitcode != 0:
-            if p.exitcode < 0:
-                return ("error", f"Docling 子进程被信号 {-p.exitcode} 杀死（段错误）", None)
-            return ("error", f"Docling 子进程异常退出 (exitcode={p.exitcode})", None)
+        if result.returncode != 0:
+            if result.returncode < 0:
+                return ("error", f"Docling 子进程被信号 {-result.returncode} 杀死（段错误）", None)
+            return ("error", f"Docling 子进程异常退出 (exitcode={result.returncode})", None)
 
         # exitcode == 0：读取结果
         with open(result_file) as f:
@@ -237,6 +221,8 @@ def _convert_with_docling(source_path: Path, output_path: Path
         if result_data.get("status") == "error":
             return ("error", f"Docling: {result_data['error']}", None)
 
+    except subprocess.TimeoutExpired:
+        return ("error", "Docling 子进程超时（>600s），已强制终止", None)
     finally:
         try:
             os.unlink(result_file)
