@@ -180,38 +180,82 @@ def scan_compatibility(directory: Path) -> list[tuple[Path, str]]:
     return problems
 
 
+def _docling_worker(source_path: str, output_path: str, result_file: str):
+    """子进程：单独运行 docling 转换，结果写回 result_file"""
+    try:
+        from docling.document_converter import DocumentConverter
+        conv = DocumentConverter()
+        result = conv.convert(source_path)
+        md_content = result.document.export_to_markdown()
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(md_content)
+        with open(result_file, 'w') as f:
+            import json; json.dump({"status": "ok"}, f)
+    except Exception as e:
+        with open(result_file, 'w') as f:
+            import json; json.dump({"status": "error", "error": f"{type(e).__name__}: {e}"}, f)
+
+
 def _convert_with_docling(source_path: Path, output_path: Path
                           ) -> Tuple[str, Optional[str], Optional[str]]:
     """
-    用 Docling 转换文档（支持 docx/pdf）。
+    用 Docling 转换文档（支持 docx/pdf），隔离在子进程中。
+    Docling 的 C 扩展在遇到损坏文件时可能 segfault，
+    子进程模式确保主进程不会因此崩溃。
     返回 (status, error, warning)。
     """
+    import multiprocessing as mp
+    import tempfile
+    import json
+
+    rf = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
+    rf.close()
+    result_file = rf.name
+
+    p = mp.Process(
+        target=_docling_worker,
+        args=(str(source_path), str(output_path), result_file),
+    )
+    p.start()
+    p.join(timeout=CONVERT_TIMEOUT)
+
     try:
-        conv = _get_docling_converter()
-        result = conv.convert(str(source_path))
+        if p.is_alive():
+            p.kill()
+            p.join()
+            return ("error", "Docling 子进程超时（>600s），已强制终止", None)
 
-        md_content = result.document.export_to_markdown()
+        if p.exitcode != 0:
+            if p.exitcode < 0:
+                return ("error", f"Docling 子进程被信号 {-p.exitcode} 杀死（段错误）", None)
+            return ("error", f"Docling 子进程异常退出 (exitcode={p.exitcode})", None)
 
-        if not md_content.strip():
-            return ("empty", "Docling 转换内容为空", None)
+        # exitcode == 0：读取结果
+        with open(result_file) as f:
+            result_data = json.load(f)
 
-        # 清洁模板段落
-        md_content = _clean_md_content(md_content)
-        if not md_content.strip():
-            return ("empty", "内容为空（移除了所有模板段落）", None)
+        if result_data.get("status") == "error":
+            return ("error", f"Docling: {result_data['error']}", None)
 
-        _ensure_output_dir(output_path)
-        output_path.write_text(md_content, encoding="utf-8")
+    finally:
+        try:
+            os.unlink(result_file)
+        except OSError:
+            pass
 
-        # 检查 MD 文件大小预警
-        warning = _check_md_size(output_path)
+    # 子进程转换成功，读取输出文件进行后处理
+    md_content = output_path.read_text(encoding="utf-8")
+    if not md_content.strip():
+        return ("empty", "Docling 转换内容为空", None)
 
-        return ("ok", None, warning)
+    md_content = _clean_md_content(md_content)
+    if not md_content.strip():
+        return ("empty", "内容为空（移除了所有模板段落）", None)
 
-    except ImportError:
-        return ("error", "缺少 docling 库", None)
-    except Exception as e:
-        return ("error", f"Docling {type(e).__name__}: {e}", None)
+    output_path.write_text(md_content, encoding="utf-8")
+    warning = _check_md_size(output_path)
+
+    return ("ok", None, warning)
 
 
 # ============================================================
