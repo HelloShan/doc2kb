@@ -141,6 +141,7 @@ class ProgressStats:
         self.convert_new = 0
         self.convert_changed = 0
         self.convert_retry = 0
+        self.convert_retry_ingest = 0
         self.convert_skipped = 0
 
     def add_convert_file_info(self, reason: str):
@@ -151,6 +152,8 @@ class ProgressStats:
             self.convert_changed += 1
         elif reason == "retry":
             self.convert_retry += 1
+        elif reason == "retry_ingest":
+            self.convert_retry_ingest += 1
         elif reason == "skip":
             self.convert_skipped += 1
 
@@ -267,7 +270,17 @@ def run_build(args, log: Logger):
             entry = state.get_file_state(rel)
             if state.needs_rebuild(rel, sha256):
                 state.init_file(rel, sha256, stat.st_size, mtime)
-                if not ingest_only:
+
+                # 关键优化：如果转换已完成但入库未完成，直接进 ingest 队列，不重复转换
+                if state.is_convert_done(rel):
+                    if not convert_only:
+                        md_path = OUTPUT_MD_DIR / Path(rel).with_suffix(".md")
+                        if md_path.exists():
+                            files_to_ingest.append((md_path, rel, sha256))
+                        stats.add_convert_file_info("retry_ingest")
+                    else:
+                        stats.add_convert_file_info("skip")
+                elif not ingest_only:
                     files_to_convert.append(fp)
                     # 判断原因：新文件、已变更、还是上次失败
                     if entry is None:
@@ -317,7 +330,9 @@ def run_build(args, log: Logger):
             if stats.convert_changed:
                 parts.append(f"变更 {stats.convert_changed}")
             if stats.convert_retry:
-                parts.append(f"重试 {stats.convert_retry}")
+                parts.append(f"重试转换 {stats.convert_retry}")
+            if stats.convert_retry_ingest:
+                parts.append(f"直接入库 {stats.convert_retry_ingest}")
             if stats.convert_skipped:
                 parts.append(f"跳过 {stats.convert_skipped} (未变更)")
             log.info("  " + ", ".join(parts) + f"，共 {len(files_to_convert)} 个文件")
@@ -459,7 +474,7 @@ def _print_final_report(state: PipelineState, stats: ProgressStats,
         for rel, entry in failed:
             conv = entry.get("conversion", {})
             st = conv.get("status", "?") 
-            err = conv.get("error", st)
+            err = conv.get("error") or st
             short_err = err[:100] if len(err) > 100 else err
             by_error.setdefault(short_err, []).append((rel, st))
 
@@ -585,7 +600,7 @@ def run_list_failed(args, log: Logger):
         for rel, entry in conv_failed:
             conv = entry.get("conversion", {})
             st = conv.get("status", "?")
-            err = conv.get("error", st)
+            err = conv.get("error") or st
             short_err = err[:100] if len(err) > 100 else err
             by_error.setdefault(short_err, []).append((rel, st))
 
@@ -603,7 +618,7 @@ def run_list_failed(args, log: Logger):
         for rel, entry in ing_failed:
             ing = entry.get("ingestion", {})
             st = ing.get("status", "?")
-            err = ing.get("error", st)
+            err = ing.get("error") or st
             short_err = err[:100] if len(err) > 100 else err
             by_error.setdefault(short_err, []).append((rel, st))
 
