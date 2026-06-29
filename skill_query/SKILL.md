@@ -74,6 +74,29 @@ curl -X POST http://127.0.0.1:8788/ \
 
 ## 返回格式
 
+### 混合检索策略
+
+doc2kb 使用 **BM25 全文检索 + 向量语义检索** 的 hybrid 模式，经 RRF (Reciprocal Rank Fusion) 融合排序：
+
+| 成分 | 作用 |
+|------|------|
+| BM25 FTS | 精确关键词匹配（专有名词、缩写、型号等） |
+| 向量检索 | 语义相似度匹配（近义词、同义表述） |
+| RRF 融合 | 两种分数按 rank 融合，取 top-K |
+
+> LanceDB 的 `_distance` 在 hybrid 模式下是 RRF 融合分（非 cosine 距离），
+> server.py 自动归一化为 0~1 相似度：`sim = 1 / (1 + _distance)`。
+
+### 置信度分级
+
+| 相似度 | 置信度 | 建议 |
+|--------|--------|------|
+| ≥ 0.85 | high | 可直接引用 |
+| 0.70 ~ 0.85 | medium | 建议交叉验证 |
+| < 0.70 | low | 需声明置信度低 |
+
+### JSON 格式
+
 ```json
 {
   "found": true,
@@ -101,3 +124,4 @@ curl -X POST http://127.0.0.1:8788/ \
 2. **冷启动 ~5s** — 首次查询加载模型，后续查询毫秒级
 3. **必须先 build** — 无知识库时所有查询报错
 4. **端口 8788** — 如端口冲突，设 `DOC2KB_QA_SERVER_PORT` 换一个
+5. **全量重建后 FTS 索引才生效** — 混合检索依赖 LanceDB FTS 索引，存量表需 `python doc_pipeline.py build --full` 重建后才会有 FTS
