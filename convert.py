@@ -185,21 +185,10 @@ def _convert_with_docling(source_path: Path, output_path: Path
     """
     用 Docling 转换文档（支持 docx/pdf）。
     返回 (status, error, warning)。
-    静默 Docling 内部的图片/VML/格式不兼容等噪音。
     """
-    import contextlib
-    from io import StringIO
-
-    stderr_buf = None
-
     try:
         conv = _get_docling_converter()
-
-        # 静默 Docling 内部的 stderr 噪音（图片/VML/docm 错误等）
-        # 用 StringIO 而不是 /dev/null：正常时丢弃，异常时贴进错误信息
-        stderr_buf = StringIO()
-        with contextlib.redirect_stderr(stderr_buf):
-            result = conv.convert(str(source_path))
+        result = conv.convert(str(source_path))
 
         md_content = result.document.export_to_markdown()
 
@@ -222,11 +211,7 @@ def _convert_with_docling(source_path: Path, output_path: Path
     except ImportError:
         return ("error", "缺少 docling 库", None)
     except Exception as e:
-        stderr_text = stderr_buf.getvalue().strip() if stderr_buf else ""
-        detail = f"{type(e).__name__}: {e}"
-        if stderr_text:
-            detail += f"\n[stderr] {stderr_text[-500:]}"
-        return ("error", detail, None)
+        return ("error", f"Docling {type(e).__name__}: {e}", None)
 
 
 # ============================================================
