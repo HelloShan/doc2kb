@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config import (
     SOURCE_DIR, OUTPUT_MD_DIR, SUPPORTED_EXTENSIONS,
-    CONVERT_WORKERS, MAX_MD_FILE_SIZE_KB,
+    CONVERT_WORKERS, MAX_MD_FILE_SIZE_KB, CONVERT_TIMEOUT,
 )
 from validate import is_file_readable
 from state import compute_sha256
@@ -922,22 +922,42 @@ def convert_single_file(source_path: Path) -> dict:
 
 def convert_batch(file_paths: List[Path],
                   max_workers: int = CONVERT_WORKERS,
+                  timeout: int = CONVERT_TIMEOUT,
                   progress_callback=None) -> List[dict]:
-    """批量转换文件，支持 Ctrl+C 中断。"""
+    """批量转换文件，支持 Ctrl+C 中断和单文件超时。"""
     results = []
+    stuck_files = []
+
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(convert_single_file, fp): fp for fp in file_paths}
         try:
             for future in as_completed(futures):
-                result = future.result()
+                fp = futures[future]
+                try:
+                    result = future.result(timeout=timeout)
+                except TimeoutError:
+                    rel = fp.relative_to(SOURCE_DIR).as_posix() if hasattr(fp, 'relative_to') else str(fp)
+                    stuck_files.append(rel)
+                    result = {
+                        "rel_path": rel,
+                        "status": "error",
+                        "md_path": None,
+                        "error": f"转换超时（>{timeout}s），已跳过（线程可能仍在运行）",
+                        "warning": None,
+                        "sha256": "",
+                        "size": 0,
+                        "mtime": "",
+                    }
+                    future.cancel()
                 results.append(result)
                 if progress_callback:
                     progress_callback(result)
         except KeyboardInterrupt:
             for f in futures:
                 f.cancel()
-            pool.shutdown(wait=False)
             raise
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     results.sort(key=lambda r: r["rel_path"])
     return results

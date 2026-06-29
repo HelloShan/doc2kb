@@ -21,7 +21,7 @@ from config import (
     EMBEDDING_MODEL, VECTOR_DIM,
     CHUNK_SIZE, CHUNK_OVERLAP,
     EMBED_BATCH_SIZE, DB_FLUSH_INTERVAL,
-    CONVERT_WORKERS,
+    CONVERT_WORKERS, CONVERT_TIMEOUT,
 )
 from validate import is_file_readable
 from state import compute_sha256
@@ -279,6 +279,7 @@ def ingest_single_md(md_path: Path, source_rel_path: str,
 
 def ingest_batch(md_file_map: List[Tuple[Path, str, str]],
                  max_workers: int = CONVERT_WORKERS,
+                 timeout: int = CONVERT_TIMEOUT,
                  flush_interval: int = DB_FLUSH_INTERVAL,
                  progress_callback=None) -> List[dict]:
     """
@@ -290,6 +291,8 @@ def ingest_batch(md_file_map: List[Tuple[Path, str, str]],
         待入库的文件信息。
     max_workers : int
         并行线程数。
+    timeout : int
+        单文件超时秒数。
     flush_interval : int
         每处理 N 个文件后强制 flush 并释放内存。
     progress_callback : callable, optional
@@ -310,7 +313,17 @@ def ingest_batch(md_file_map: List[Tuple[Path, str, str]],
 
         try:
             for future in as_completed(futures):
-                result = future.result()
+                md_path, src_rel = futures[future]
+                try:
+                    result = future.result(timeout=timeout)
+                except TimeoutError:
+                    result = {
+                        "rel_path": src_rel,
+                        "status": "error",
+                        "chunks": 0,
+                        "error": f"入库超时（>{timeout}s），已跳过",
+                    }
+                    future.cancel()
                 results.append(result)
                 count_since_flush += 1
 
@@ -326,8 +339,9 @@ def ingest_batch(md_file_map: List[Tuple[Path, str, str]],
         except KeyboardInterrupt:
             for f in futures:
                 f.cancel()
-            pool.shutdown(wait=False)
             raise
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     # 排序保证结果稳定
     results.sort(key=lambda r: r["rel_path"])

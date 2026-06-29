@@ -143,6 +143,11 @@ class ProgressStats:
         self.convert_retry = 0
         self.convert_retry_ingest = 0
         self.convert_skipped = 0
+        # 进度计数器
+        self.convert_processed = 0
+        self.convert_total = 0
+        self.ingest_processed = 0
+        self.ingest_total = 0
 
     def add_convert_file_info(self, reason: str):
         """记录文件进入转换队列的原因"""
@@ -258,7 +263,7 @@ def run_build(args, log: Logger):
 
         if is_full:
             # 全量模式：所有文件都需要处理
-            state.init_file(rel, sha256, stat.st_size, mtime, str(fp))
+            state.init_file(rel, sha256, stat.st_size, mtime, str(fp.resolve()))
             if not convert_only and not ingest_only:
                 files_to_convert.append(fp)
                 stats.add_convert_file_info("new")
@@ -269,7 +274,7 @@ def run_build(args, log: Logger):
             # 增量模式：只处理变更或失败的文件
             entry = state.get_file_state(rel)
             if state.needs_rebuild(rel, sha256):
-                state.init_file(rel, sha256, stat.st_size, mtime, str(fp))
+                state.init_file(rel, sha256, stat.st_size, mtime, str(fp.resolve()))
 
                 # 关键优化：如果转换已完成但入库未完成，直接进 ingest 队列，不重复转换
                 if state.is_convert_done(rel):
@@ -291,7 +296,7 @@ def run_build(args, log: Logger):
                         stats.add_convert_file_info("retry")
             else:
                 # 文件未变更且转换已成功，跳过
-                state.init_file(rel, sha256, stat.st_size, mtime, str(fp))
+                state.init_file(rel, sha256, stat.st_size, mtime, str(fp.resolve()))
                 stats.add_convert_file_info("skip")
 
     # 入库文件列表：
@@ -341,6 +346,8 @@ def run_build(args, log: Logger):
         t0 = time.time()
 
         from convert import convert_batch
+        stats.convert_total = len(files_to_convert)
+        stats.convert_processed = 0
         conv_results = convert_batch(
             files_to_convert,
             max_workers=CONVERT_WORKERS,
@@ -379,6 +386,8 @@ def run_build(args, log: Logger):
         t0 = time.time()
 
         from ingest import ingest_batch
+        stats.ingest_total = len(files_to_ingest)
+        stats.ingest_processed = 0
         ing_results = ingest_batch(
             files_to_ingest,
             max_workers=CONVERT_WORKERS,
@@ -407,14 +416,16 @@ def _on_convert_done(result: dict, state: PipelineState,
                             md_path=result.get("md_path"),
                             error=error)
     stats.convert_done(result)
+    stats.convert_processed += 1
     state.save()  # 实时写盘，防止杀进程丢进度
 
+    progress = f"[{stats.convert_processed}/{stats.convert_total}]"
     if status == "ok":
         warning = result.get("warning")
         if warning:
-            log.warn(f"  ⚠ {rel}: {warning}")
+            log.warn(f"  ⚠ {progress} {rel}: {warning}")
         else:
-            log.ok(f"  {rel}")
+            log.ok(f"  {progress} {rel}")
     elif status == "skip":
         log.warn(f"  跳过 {rel}: {error}")
     elif status == "garbled":
@@ -436,10 +447,12 @@ def _on_ingest_done(result: dict, state: PipelineState,
                            chunks=result.get("chunks", 0),
                            error=error)
     stats.ingest_done(result)
+    stats.ingest_processed += 1
     state.save()  # 实时写盘，防止杀进程丢进度
 
+    progress = f"[{stats.ingest_processed}/{stats.ingest_total}]"
     if status == "ok":
-        log.ok(f"  {rel} ({result.get('chunks', 0)} chunks)")
+        log.ok(f"  {progress} {rel} ({result.get('chunks', 0)} chunks)")
     else:
         log.err(f"  入库失败 {rel}: {error}")
 
