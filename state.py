@@ -236,6 +236,12 @@ class PipelineState:
         entry["ingestion"] = make_ingestion_record(status, chunks, error)
         self._dirty = True
 
+    def remove_file(self, rel_path: str):
+        """从状态中删除文件记录。"""
+        if rel_path in self._data["files"]:
+            del self._data["files"][rel_path]
+            self._dirty = True
+
     def reset_file(self, rel_path: str):
         """重置文件状态为待处理。"""
         entry = self._data["files"].get(rel_path)

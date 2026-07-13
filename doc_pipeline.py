@@ -37,6 +37,12 @@ doc2kb — 统一文档流水线 CLI
   # 查看知识库统计
   python doc_pipeline.py stats
 
+  # 从知识库中删除文档
+  python doc_pipeline.py delete --list-sources      # 列出所有源文件
+  python doc_pipeline.py delete --source "file.md"   # 按 source 精确删除
+  python doc_pipeline.py delete --prefix "废弃/"     # 按前缀删除
+  python doc_pipeline.py delete --all                # 清空整个知识库
+
 跨平台：支持 Windows 11 / Linux / macOS
 最低配置：2 线程, 2GB 内存
 """
@@ -64,13 +70,14 @@ from config import (
     validate_config,
 )
 from state import (
-    PipelineState, compute_sha256, collect_files,
+    PipelineState, compute_sha256, collect_files, get_file_mtime_iso,
     ST_OK, ST_SKIP, ST_GARBLED, ST_EMPTY, ST_ERROR, ST_PENDING,
     RETRYABLE_STATUSES,
 )
 from convert import convert_single_file, scan_compatibility
 from ingest import (
-    ingest_single_md, rebuild_table, get_db_stats, close_db
+    ingest_single_md, rebuild_table, get_db_stats, close_db,
+    _open_or_create_db,
 )
 
 
@@ -233,7 +240,7 @@ def run_build(args, log: Logger):
     all_files = collect_files(SOURCE_DIR, SUPPORTED_EXTENSIONS)
     log.info(f"   找到 {len(all_files)} 个源文件")
 
-    if not all_files:
+    if not all_files and not ingest_only:
         log.warn("源目录中没有支持的文档文件")
         log.info(f"支持的格式: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
         return
@@ -302,13 +309,34 @@ def run_build(args, log: Logger):
     # 入库文件列表：
     # 如果 ingest_only，从状态中找所有已完成转换但未入库的文件
     if ingest_only:
-        for fp in all_files:
-            rel = fp.relative_to(SOURCE_DIR).as_posix()
-            if state.is_convert_done(rel) and not state.is_ingest_done(rel):
-                md_path = OUTPUT_MD_DIR / Path(rel).with_suffix(".md")
-                if md_path.exists():
-                    files_to_ingest.append((md_path, rel, state.get_file_sha256(rel)))
-        log.info(f"  待入库（仅新建入库）: {len(files_to_ingest)} 个 MD 文件")
+        if not all_files and OUTPUT_MD_DIR.exists():
+            # 源目录无文件 + OUTPUT_MD_DIR 有 .md 文件 = 从其他设备迁移的场景
+            log.info("  源目录为空，已从 OUTPUT_MD_DIR 扫描 .md 文件进行入库...")
+            md_files = sorted(OUTPUT_MD_DIR.rglob("*.md"))
+            for md_path in md_files:
+                rel = md_path.relative_to(OUTPUT_MD_DIR).as_posix()
+                sha256 = compute_sha256(md_path)
+                # 在状态中标记为转换完成，以便 ingestion 回写时状态一致
+                state.init_file(rel, sha256,
+                                size=md_path.stat().st_size,
+                                mtime=get_file_mtime_iso(md_path),
+                                abs_source_path=str(md_path.resolve()))
+                state.update_conversion(rel, "ok",
+                                        md_path=str(md_path.resolve()))
+                if not state.is_ingest_done(rel):
+                    files_to_ingest.append((md_path, rel, sha256))
+            if not md_files:
+                log.warn("  OUTPUT_MD_DIR 中没有找到 .md 文件")
+            else:
+                log.info(f"  待入库（OUTPUT_MD_DIR 扫描）: {len(files_to_ingest)} 个 MD 文件")
+        else:
+            for fp in all_files:
+                rel = fp.relative_to(SOURCE_DIR).as_posix()
+                if state.is_convert_done(rel) and not state.is_ingest_done(rel):
+                    md_path = OUTPUT_MD_DIR / Path(rel).with_suffix(".md")
+                    if md_path.exists():
+                        files_to_ingest.append((md_path, rel, state.get_file_sha256(rel)))
+            log.info(f"  待入库（仅新建入库）: {len(files_to_ingest)} 个 MD 文件")
     elif not convert_only:
         # 正常流水线：转换完还要入库
         if is_full:
@@ -699,6 +727,118 @@ def run_stats(args, log: Logger):
 
 
 # ============================================================
+# delete 子命令
+# ============================================================
+
+def run_delete(args, log: Logger):
+    """从 LanceDB 知识库中删除文档。"""
+    table = _open_or_create_db()
+    total_before = table.count_rows()
+
+    # ── 列出所有源文件 ──
+    if args.list_sources or (not args.source and not args.prefix and not args.all):
+        try:
+            arrow_tbl = table.to_arrow()
+            unique = sorted(set(arrow_tbl.column('source').to_pylist()))
+            log.info(f"📚 知识库包含 {len(unique)} 个源文件，共 {total_before} 个向量分块：\n")
+            for src in unique:
+                log.info(f"  📄 {src}")
+            log.info("")
+            log.info("用法：")
+            log.info("  python doc_pipeline.py delete --source <文件名>    按精确文件名删除")
+            log.info("  python doc_pipeline.py delete --prefix <前缀>     按路径前缀删除（如 '废弃/'）")
+            log.info("  python doc_pipeline.py delete --all               清空整个知识库")
+            log.info("  python doc_pipeline.py delete --list-sources      列出所有源文件")
+            log.info("  所有删除操作默认需确认，加 --yes 跳过确认。")
+        except Exception as e:
+            log.err(f"无法读取知识库: {e}")
+        return
+
+    # ── 构造删除条件 ──
+    conditions = []
+    if args.source:
+        conditions.append(f'source = "{args.source}"')
+    if args.prefix:
+        prefix_escaped = args.prefix.replace('"', '""')
+        conditions.append(f'source LIKE "{prefix_escaped}%"')
+    if args.all:
+        conditions.clear()  # 忽略 source/prefix
+
+    if not conditions and not args.all:
+        log.err("请指定要删除的文档：--source / --prefix / --all")
+        return
+
+    # ── 预览影响范围 ──
+    where_clause = " AND ".join(conditions)
+    if args.all:
+        log.warn(f"🗑  将清空整个知识库（共 {total_before} 个分块），此操作不可恢复！")
+        arrow_tbl = table.to_arrow()
+        affected_sources = sorted(set(arrow_tbl.column('source').to_pylist()))
+    else:
+        # 预览匹配的源文件 — 直接扫全表筛选
+        try:
+            arrow_tbl = table.to_arrow()
+            all_sources = arrow_tbl.column('source').to_pylist()
+            # 内存中做筛选（LIKE 模拟）
+            if args.source:
+                matched = [s for s in all_sources if s == args.source]
+            else:
+                matched = [s for s in all_sources if s.startswith(args.prefix)]
+        except Exception as e:
+            log.err(f"查询失败: {e}")
+            return
+        affected_sources = sorted(set(matched))
+        if not affected_sources:
+            log.err("没有匹配的源文件")
+            return
+        log.info(f"🔍 匹配条件，将删除 {len(affected_sources)} 个源文件：\n")
+        for src in affected_sources:
+            log.info(f"  📄 {src}")
+        log.info(f"\n  共 {len(matched)} 个向量分块将被删除")
+
+    # ── 确认 ──
+    if not args.yes:
+        log.warn("\n⚠  此操作不可恢复！")
+        try:
+            confirm = input("  确认删除？[y/N]: ")
+        except (EOFError, KeyboardInterrupt):
+            log.info("")
+            log.warn("已取消")
+            return
+        if confirm.strip().lower() not in ("y", "yes"):
+            log.warn("已取消")
+            return
+
+    # ── 执行删除 ──
+    try:
+        if args.all:
+            rebuild_table()
+            log.ok(f"知识库已清空（之前共 {total_before} 个分块）")
+        else:
+            from ingest import _lancedb_lock
+            with _lancedb_lock:
+                table.delete(where_clause)
+            deleted = total_before - table.count_rows()
+            log.ok(f"已删除 {len(affected_sources)} 个源文件，共 {deleted} 个向量分块")
+    except Exception as e:
+        log.err(f"删除失败: {e}")
+        return
+
+    # ── 可选：同步清理 pipeline_state.json ──
+    if not args.all and args.state:
+        from state import PipelineState
+        state = PipelineState(STATE_FILE)
+        removed = 0
+        for src in affected_sources:
+            if state.get_file_state(src):
+                state.remove_file(src)
+                removed += 1
+        if removed:
+            state.save()
+            log.ok(f"已同步清理 pipeline_state 中的 {removed} 条记录")
+
+
+# ============================================================
 # CLI 入口
 # ============================================================
 
@@ -744,6 +884,21 @@ def main():
     # check
     subparsers.add_parser("check", help="扫描源目录，检查文件兼容性")
 
+    # delete
+    delete_p = subparsers.add_parser("delete", help="从知识库中删除文档")
+    delete_p.add_argument("--source", type=str, default=None,
+                          help="按精确 source 路径删除，如 'doc/xxx.md'")
+    delete_p.add_argument("--prefix", type=str, default=None,
+                          help="按 source 路径前缀删除，如 '废弃/'")
+    delete_p.add_argument("--all", action="store_true",
+                          help="清空整个知识库")
+    delete_p.add_argument("--list-sources", action="store_true",
+                          help="列出知识库中所有源文件")
+    delete_p.add_argument("--yes", "-y", action="store_true",
+                          help="跳过确认提示")
+    delete_p.add_argument("--state", action="store_true",
+                          help="同步清理 pipeline_state.json 中的记录")
+
     args = parser.parse_args()
 
     # 初始化日志
@@ -763,6 +918,8 @@ def main():
             run_check(args, log)
         elif args.command == "stats":
             run_stats(args, log)
+        elif args.command == "delete":
+            run_delete(args, log)
         else:
             parser.print_help()
     except KeyboardInterrupt:

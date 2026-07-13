@@ -19,7 +19,7 @@ pypdf>=5.0             # .pdf → MD 轻量转换（纯Python）
 openpyxl>=3.1          # .xlsx → MD 转换（Excel → Markdown表格）
 xlrd>=2.0              # .xls  → MD 转换（旧版Excel）
 olefile>=0.47          # .doc  → MD 回退提取（纯Python，无格式）
-pywin32>=306           # .doc → .docx 转换（Windows 调用 Office/WPS COM）
+#pywin32>=306           # .doc → .docx 转换（Windows 调用 Office/WPS COM）
 
 # ============================================================
 # 【可选层】按需安装
